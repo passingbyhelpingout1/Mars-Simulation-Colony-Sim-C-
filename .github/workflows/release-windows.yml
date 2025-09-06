@@ -1,0 +1,35 @@
+name: Release (Windows EXE)
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-win:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Set up MSVC build environment
+      - name: MSVC Dev Cmd
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build mars.exe (static CRT)
+        shell: cmd
+        run: cl /nologo /EHsc /std:c++17 /O2 /W4 /MT /Fe:mars.exe mars_colony.cpp
+
+      - name: Create checksum
+        shell: powershell
+        run: |
+          (Get-FileHash .\mars.exe -Algorithm SHA256).Hash + "  mars.exe" | Out-File -Encoding ASCII SHA256SUMS.txt
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            mars.exe
+            SHA256SUMS.txt
