@@ -3,9 +3,11 @@
 
   Key improvements for Windows:
    • Robust menu input (line-based), no silent exit on bad input.
-   • Optional CLI flags: --autorun N, --headless N, --no-pause.
+   • Optional CLI flags: --autorun N, --headless N, --no-pause, --seed U32, --load FILE, --save FILE.
    • Try/catch with clear error messages instead of sudden close.
    • Text simplified to ASCII for maximum console compatibility.
+   • Deterministic save/load (versioned text format) + reproducible RNG seeds.
+   • Discrete non-critical power dispatch via a tiny 0/1 knapsack optimizer.
 
   Build (MinGW-w64 g++):
     g++ -std=c++17 -O2 -Wall -Wextra -o MarsColony.exe mars_colony.cpp
@@ -22,6 +24,8 @@
 #include <limits>
 #include <chrono>
 #include <sstream>
+#include <fstream>
+#include <cstdint>
 
 using std::cout;
 using std::cin;
@@ -50,6 +54,13 @@ static int readInt(const string& prompt, int minVal, int maxVal) {
         if ((ss >> v) && v >= minVal && v <= maxVal) return v;
         cout << "Please enter a number between " << minVal << " and " << maxVal << ".\n";
     }
+}
+
+static string readLine(const string& prompt, const string& defValue) {
+    cout << prompt << " [" << defValue << "]: ";
+    string line;
+    if (!std::getline(cin >> std::ws, line) || line.empty()) return defValue;
+    return line;
 }
 
 // ----------- Core types ------------------------------------------------------
@@ -169,6 +180,7 @@ struct GameState {
     LastPowerReport lastPower;
 
     std::mt19937 rng;
+    uint32_t rngSeed = 0; // recorded for reproducibility
 
     GameState() {
         unsigned seed = 0u;
@@ -180,22 +192,139 @@ struct GameState {
                 std::chrono::high_resolution_clock::now().time_since_epoch().count()
             );
         }
+        rngSeed = static_cast<uint32_t>(seed);
         rng.seed(seed);
     }
 };
 
 class Game {
 public:
-    Game() {
-        // Starter setup
-        addBuilding(BuildingType::Habitat);
-        addBuilding(BuildingType::SolarArray);
-        addBuilding(BuildingType::SolarArray);
-        addBuilding(BuildingType::SolarArray);
-        addBuilding(BuildingType::BatteryBank);
-        addBuilding(BuildingType::WaterExtractor);
-        addBuilding(BuildingType::Greenhouse);
-        addBuilding(BuildingType::Electrolyzer);
+    Game() { initStarter(); }
+
+    void setSeed(uint32_t seed) {
+        s.rngSeed = seed;
+        s.rng.seed(seed);
+    }
+
+    bool saveToFile(const string& path) const {
+        std::ofstream ofs(path, std::ios::out);
+        if (!ofs) { cout << "Failed to open '" << path << "' for writing.\n"; return false; }
+
+        ofs << "MARS_SAVE 1\n";
+        ofs << "hour " << s.hour << "\n";
+        ofs << "population " << s.population << "\n";
+        ofs << "housing " << s.housingCapacity << "\n";
+        ofs << "morale " << std::setprecision(17) << s.morale << "\n";
+        ofs << std::setprecision(17);
+        ofs << "res " << s.res.powerStored << " " << s.res.batteryCapacity << " "
+            << s.res.water << " " << s.res.oxygen << " " << s.res.food << " "
+            << s.res.metals << " " << s.res.credits << "\n";
+
+        ofs << "buildings " << s.buildings.size() << "\n";
+        for (const auto& b : s.buildings) {
+            ofs << "b " << static_cast<int>(b.type) << " " << (b.active ? 1 : 0) << "\n";
+        }
+
+        ofs << "effects " << s.effects.size() << "\n";
+        for (const auto& e : s.effects) {
+            ofs << "e " << 0 /* DustStorm */ << " " << e.hoursRemaining << " "
+                << e.solarMultiplier << "\n";
+        }
+
+        ofs << "lastpower " << s.lastPower.producers << " " << s.lastPower.criticalDemand
+            << " " << s.lastPower.nonCriticalDemand << " " << s.lastPower.nonCriticalEff
+            << " " << (s.lastPower.blackout ? 1 : 0) << "\n";
+
+        ofs << "rngseed " << s.rngSeed << "\n";
+        std::ostringstream rngoss;
+        rngoss << s.rng;
+        ofs << "rngstate " << rngoss.str() << "\n";
+        ofs << "end\n";
+        cout << "Saved to '" << path << "'.\n";
+        return true;
+    }
+
+    bool loadFromFile(const string& path) {
+        std::ifstream ifs(path, std::ios::in);
+        if (!ifs) { cout << "Failed to open '" << path << "' for reading.\n"; return false; }
+
+        string tag; int version = 0;
+        if (!(ifs >> tag >> version) || tag != "MARS_SAVE" || version != 1) {
+            cout << "Unrecognized save file header.\n"; return false;
+        }
+
+        // Reset minimal state; we will overwrite fields
+        GameState loaded;
+
+        string key;
+        // Consume endline after header
+        ifs.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+
+        while (ifs >> key) {
+            if (key == "hour") {
+                ifs >> loaded.hour; ifs.ignore(1, '\n');
+            } else if (key == "population") {
+                ifs >> loaded.population; ifs.ignore(1, '\n');
+            } else if (key == "housing") {
+                ifs >> loaded.housingCapacity; ifs.ignore(1, '\n');
+            } else if (key == "morale") {
+                ifs >> loaded.morale; ifs.ignore(1, '\n');
+            } else if (key == "res") {
+                ifs >> loaded.res.powerStored >> loaded.res.batteryCapacity
+                    >> loaded.res.water >> loaded.res.oxygen >> loaded.res.food
+                    >> loaded.res.metals >> loaded.res.credits;
+                ifs.ignore(1, '\n');
+            } else if (key == "buildings") {
+                size_t n=0; ifs >> n; ifs.ignore(1, '\n');
+                loaded.buildings.clear(); loaded.buildings.reserve(n);
+                for (size_t i=0;i<n;++i) {
+                    string btag; int t=0, act=1;
+                    ifs >> btag >> t >> act; ifs.ignore(1, '\n');
+                    if (btag!="b") { cout << "Bad building tag in save.\n"; return false; }
+                    BuildingType bt = static_cast<BuildingType>(t);
+                    loaded.buildings.push_back(Building{bt, act!=0});
+                }
+            } else if (key == "effects") {
+                size_t n=0; ifs >> n; ifs.ignore(1, '\n');
+                loaded.effects.clear(); loaded.effects.reserve(n);
+                for (size_t i=0;i<n;++i) {
+                    string etag; int t=0, hrs=0; double mult=1.0;
+                    ifs >> etag >> t >> hrs >> mult; ifs.ignore(1, '\n');
+                    if (etag!="e") { cout << "Bad effect tag in save.\n"; return false; }
+                    ActiveEffect e;
+                    e.type = EffectType::DustStorm;
+                    e.hoursRemaining = hrs;
+                    e.solarMultiplier = mult;
+                    e.description = "Dust Storm (solar " + std::to_string(int(mult*100)) + "%)";
+                    loaded.effects.push_back(e);
+                }
+            } else if (key == "lastpower") {
+                int blackoutInt=0;
+                ifs >> loaded.lastPower.producers >> loaded.lastPower.criticalDemand
+                    >> loaded.lastPower.nonCriticalDemand >> loaded.lastPower.nonCriticalEff
+                    >> blackoutInt;
+                loaded.lastPower.blackout = (blackoutInt!=0);
+                ifs.ignore(1, '\n');
+            } else if (key == "rngseed") {
+                unsigned seed=0; ifs >> seed; loaded.rngSeed = seed; ifs.ignore(1, '\n');
+            } else if (key == "rngstate") {
+                // read rest of line as state
+                string rest;
+                std::getline(ifs, rest);
+                std::istringstream iss(rest);
+                iss >> loaded.rng;
+            } else if (key == "end") {
+                break;
+            } else {
+                // consume rest of line for unknown key
+                ifs.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            }
+        }
+
+        // Swap in loaded state
+        s = std::move(loaded);
+        cout << "Loaded from '" << path << "'.\n";
+        return true;
     }
 
     void runCLI() {
@@ -209,8 +338,10 @@ public:
                  << "4) Advance 24 hours (1 sol)\n"
                  << "5) Build structure\n"
                  << "6) Tips\n"
+                 << "7) Save game\n"
+                 << "8) Load game\n"
                  << "0) Quit\n";
-            int choice = readInt("Select: ", 0, 6);
+            int choice = readInt("Select: ", 0, 8);
             switch (choice) {
                 case 1: showStatus(); break;
                 case 2: advanceHours(1); break;
@@ -218,6 +349,8 @@ public:
                 case 4: advanceHours(24); break;
                 case 5: doBuildMenu(); break;
                 case 6: printTips(); break;
+                case 7: { string f = readLine("Save file name", "savegame.mc"); saveToFile(f); } break;
+                case 8: { string f = readLine("Load file name", "savegame.mc"); loadFromFile(f); } break;
                 case 0: running = false; break;
                 default: cout << "Unknown selection.\n"; break;
             }
@@ -243,6 +376,18 @@ public:
 
 private:
     GameState s;
+
+    void initStarter() {
+        // Starter setup
+        addBuilding(BuildingType::Habitat);
+        addBuilding(BuildingType::SolarArray);
+        addBuilding(BuildingType::SolarArray);
+        addBuilding(BuildingType::SolarArray);
+        addBuilding(BuildingType::BatteryBank);
+        addBuilding(BuildingType::WaterExtractor);
+        addBuilding(BuildingType::Greenhouse);
+        addBuilding(BuildingType::Electrolyzer);
+    }
 
     // ---- Time/Daylight ------------------------------------------------------
 
@@ -278,6 +423,7 @@ private:
         cout << "  MARS COLONY — Starter Simulation\n";
         cout << "=====================================\n";
         cout << "Sol " << sol() << ", Hour " << hourOfSol() << " — Colony initialized.\n";
+        cout << "RNG seed: " << s.rngSeed << "\n";
         cout << "Use the menu numbers to choose actions.\n";
     }
 
@@ -333,6 +479,7 @@ private:
         cout << "* Habitats increase housing; avoid overcrowding for morale.\n";
         cout << "* Watch the power line (prod/crit/noncrit). Avoid blackouts.\n";
         cout << "* Try advancing 6-24 hours, then build with the resources you have.\n";
+        cout << "* Save often! You can reload and explore different strategies.\n";
     }
 
     void listBuildOptions() const {
@@ -674,6 +821,10 @@ int main(int argc, char** argv) {
     long long autorunHours = 0;
     bool headless = false;
 
+    bool seedProvided = false;
+    uint32_t seedOverride = 0;
+    string loadPath, savePath;
+
     // Parse simple CLI flags
     for (int i = 1; i < argc; ++i) {
         string arg = argv[i];
@@ -684,15 +835,30 @@ int main(int argc, char** argv) {
             headless = true;
         } else if (arg == "--no-pause") {
             noPause = true;
+        } else if (arg == "--seed" && i + 1 < argc) {
+            seedOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+            seedProvided = true;
+        } else if (arg == "--load" && i + 1 < argc) {
+            loadPath = argv[++i];
+        } else if (arg == "--save" && i + 1 < argc) {
+            savePath = argv[++i];
         }
     }
 
     try {
         Game g;
+        if (seedProvided) g.setSeed(seedOverride);
+
+        if (!loadPath.empty()) {
+            g.loadFromFile(loadPath);
+        }
 
         if (autorunHours > 0) {
             g.advanceHours((int)autorunHours);
             g.showStatus();
+            if (!savePath.empty()) {
+                g.saveToFile(savePath);
+            }
             if (headless) {
 #ifdef _WIN32
                 if (!noPause) {
@@ -706,6 +872,10 @@ int main(int argc, char** argv) {
         }
 
         g.runCLI();
+
+        if (!savePath.empty()) {
+            g.saveToFile(savePath);
+        }
 
 #ifdef _WIN32
         if (!noPause) {
