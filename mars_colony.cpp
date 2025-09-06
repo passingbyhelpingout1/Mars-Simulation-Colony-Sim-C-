@@ -129,7 +129,7 @@ struct LastPowerReport {
     double producers = 0.0;
     double criticalDemand = 0.0;
     double nonCriticalDemand = 0.0;
-    double nonCriticalEff = 0.0; // 0..1
+    double nonCriticalEff = 0.0; // 0..1 (share of non-critical demand actually run)
     bool blackout = false;
 };
 
@@ -469,6 +469,70 @@ private:
         );
     }
 
+    // ---- Non-critical dispatch optimizer (0/1 knapsack) --------------------
+
+    // Choose which non-critical loads to turn ON this hour to maximize utility
+    // under a power budget. Utility comes from positive resource flows, weighted
+    // by current scarcity (food/oxygen/water).
+    std::vector<int> chooseNonCriticalLoads(double powerBudget,
+                                            double wFood,
+                                            double wO2,
+                                            double wWater) const
+    {
+        struct Item { int idx; int w; double v; }; // w = scaled power, v = utility
+        const int scale = 10; // 0.1 power units granularity for DP
+        int capacity = (int)(std::max(0.0, powerBudget) * scale + 0.5);
+
+        std::vector<Item> items;
+        items.reserve(s.buildings.size());
+
+        for (int i = 0; i < (int)s.buildings.size(); ++i) {
+            const auto& b  = s.buildings[i];
+            const auto& sp = getSpec(b.type);
+            if (!b.active) continue;
+            if (!sp.needsPower || sp.isCriticalLoad || sp.powerCons <= 0.0) continue;
+
+            // Utility from positive outputs, biased by scarcity.
+            double util = 0.0;
+            if (sp.foodFlow   > 0.0) util += wFood  * sp.foodFlow;
+            if (sp.oxygenFlow > 0.0) util += wO2    * sp.oxygenFlow;
+            if (sp.waterFlow  > 0.0) util += wWater * sp.waterFlow;
+
+            // Soft penalty for very power-hungry loads (efficiency bias).
+            util /= (1.0 + 0.05 * sp.powerCons);
+
+            int weight = (int)(sp.powerCons * scale + 0.5);
+            if (weight <= 0) continue;
+
+            if (util > 0.0) items.push_back({i, weight, util});
+        }
+
+        if (capacity <= 0 || items.empty()) return {};
+
+        const int n = (int)items.size();
+        std::vector<std::vector<double>> dp(n + 1, std::vector<double>(capacity + 1, 0.0));
+        std::vector<std::vector<char>>   take(n + 1, std::vector<char>(capacity + 1, 0));
+
+        for (int i = 1; i <= n; ++i) {
+            int w = items[i - 1].w;
+            double v = items[i - 1].v;
+            for (int c = 0; c <= capacity; ++c) {
+                dp[i][c] = dp[i - 1][c];
+                if (w <= c) {
+                    double cand = dp[i - 1][c - w] + v;
+                    if (cand > dp[i][c]) { dp[i][c] = cand; take[i][c] = 1; }
+                }
+            }
+        }
+
+        // Reconstruct chosen indices
+        std::vector<int> chosen;
+        for (int i = n, c = capacity; i >= 1; --i) {
+            if (take[i][c]) { chosen.push_back(items[i - 1].idx); c -= items[i - 1].w; }
+        }
+        return chosen;
+    }
+
     // ---- Power & resource update -------------------------------------------
 
     void simulateHour() {
@@ -496,32 +560,59 @@ private:
             else                   noncrit  += sp.powerCons;
         }
 
-        // 3) Allocate power/battery
-        double available = s.res.powerStored + producers - critical;
-        bool blackout = available < 0.0;
+        // Shortage-aware weights (smaller hours-of-supply => larger weight).
+        auto hoursOf = [&](double store, double ratePerHour){
+            if (ratePerHour <= 0.0) return 9999.0;
+            return (store / ratePerHour);
+        };
+        double hFood_before  = hoursOf(s.res.food,   s.population * FOOD_PER_COLONIST);
+        double hWater_before = hoursOf(s.res.water,  s.population * WAT_PER_COLONIST);
+        double hO2_before    = hoursOf(s.res.oxygen, s.population * O2_PER_COLONIST);
 
-        double noncritEff = 0.0;
+        auto weightFromHours = [](double h) {
+            // 1 + 72/(h+1): ~73 when ~0 hours left; ~2 when ~35h; ~1 when 72h+
+            return 1.0 + 72.0 / (h + 1.0);
+        };
+        double wFood  = weightFromHours(hFood_before);
+        double wWater = weightFromHours(hWater_before);
+        double wO2    = weightFromHours(hO2_before);
+
+        // 3) Allocate power/battery using discrete ON/OFF dispatch for non-critical loads
+        double availableForNoncrit = s.res.powerStored + producers - critical;
+        bool blackout = (availableForNoncrit < 0.0);
+
+        std::vector<char> runFlags(s.buildings.size(), 0);
+        double noncritUsed = 0.0;
+
         if (!blackout) {
-            if (noncrit <= 0.0) noncritEff = 0.0;
-            else noncritEff = clampv( available / noncrit, 0.0, 1.0 );
+            auto chosen = chooseNonCriticalLoads(availableForNoncrit, wFood, wO2, wWater);
+            for (int idx : chosen) {
+                runFlags[idx] = 1;
+                noncritUsed += getSpec(s.buildings[idx].type).powerCons;
+            }
         }
 
-        double used = critical + noncrit * noncritEff;
+        // Compute battery change from chosen dispatch (no negative battery, but record blackout if critical unmet)
+        double used = critical + noncritUsed;
         s.res.powerStored += (producers - used);
         s.res.powerStored = clampv(s.res.powerStored, 0.0, s.res.batteryCapacity);
 
-        // 4) Resource flows from buildings (gated by power)
+        // 4) Resource flows from buildings (gated by power and dispatch)
         double waterDelta  = 0.0;
         double oxygenDelta = 0.0;
         double foodDelta   = 0.0;
 
-        for (const auto& b : s.buildings) {
-            if (!b.active) continue;
+        for (int i = 0; i < (int)s.buildings.size(); ++i) {
+            const auto& b  = s.buildings[i];
             const auto& sp = getSpec(b.type);
+            if (!b.active) continue;
             if (sp.waterFlow == 0.0 && sp.oxygenFlow == 0.0 && sp.foodFlow == 0.0) continue;
 
             double eff = 1.0;
-            if (sp.needsPower) eff = sp.isCriticalLoad ? (blackout ? 0.0 : 1.0) : noncritEff;
+            if (sp.needsPower) {
+                if (sp.isCriticalLoad) eff = blackout ? 0.0 : 1.0;
+                else                   eff = runFlags[i] ? 1.0 : 0.0; // discrete ON/OFF
+            }
 
             waterDelta  += sp.waterFlow  * eff;
             oxygenDelta += sp.oxygenFlow * eff;
@@ -540,10 +631,6 @@ private:
 
         // 7) Morale
         double moraleDelta = 0.0;
-        auto hoursOf = [&](double store, double ratePerHour){
-            if (ratePerHour <= 0.0) return 9999.0;
-            return (store / ratePerHour);
-        };
         double hFood  = hoursOf(s.res.food,   s.population * FOOD_PER_COLONIST);
         double hWater = hoursOf(s.res.water,  s.population * WAT_PER_COLONIST);
         double hO2    = hoursOf(s.res.oxygen, s.population * O2_PER_COLONIST);
@@ -563,7 +650,7 @@ private:
         s.lastPower.producers = producers;
         s.lastPower.criticalDemand = critical;
         s.lastPower.nonCriticalDemand = noncrit;
-        s.lastPower.nonCriticalEff = noncritEff;
+        s.lastPower.nonCriticalEff = (noncrit > 0.0) ? (noncritUsed / noncrit) : 0.0; // share of non-crit demand we ran
         s.lastPower.blackout = blackout;
 
         // 9) Warnings
@@ -607,7 +694,6 @@ int main(int argc, char** argv) {
             g.advanceHours((int)autorunHours);
             g.showStatus();
             if (headless) {
-                // Exit immediately after autorun
 #ifdef _WIN32
                 if (!noPause) {
                     cout << "\n(Headless) Press Enter to exit...";
