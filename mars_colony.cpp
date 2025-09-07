@@ -45,6 +45,7 @@
 #include <stdexcept>
 #include "fixed_clock.h"
 #include "rng.h"
+#include "effects.hpp"  // << added: pruneExpiredEffects(...)
 
 using std::cout;
 using std::cin;
@@ -897,17 +898,8 @@ private:
         for (auto& e : s.effects) {
             if (e.hoursRemaining > 0) --e.hoursRemaining;
         }
-        s.effects.erase(
-            std::remove_if(s.effects.begin(), s.effects.end(),
-                [&](const ActiveEffect& e){
-                    if (e.hoursRemaining <= 0) {
-                        if (!forecastMode) cout << "[Weather] " << e.description << " has cleared.\n";
-                        return true;
-                    }
-                    return false;
-                }),
-            s.effects.end()
-        );
+        // Patched: delegate pruning + user-facing log to a single helper.
+        effects::pruneExpiredEffects(s.effects, forecastMode);
     }
 
     // ---- Non-critical dispatch optimizer (0/1 knapsack) --------------------
