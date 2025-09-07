@@ -5,21 +5,33 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     outputs:
-      hash: ${{ steps.run.outputs.hash }}
+      hash: ${{ steps.hash.outputs.hash }}
     steps:
       - uses: actions/checkout@v4
       - name: Build (GCC)
-        run: g++ -std=c++17 -O2 -Wall -Wextra -o mars mars_colony.cpp
-      - name: Run replay & hash
-        id: run
+        run: g++ -std=c++17 -O2 -Wall -Wextra -Isrc -o mars mars_colony.cpp
+      - name: Make sample replay using the game itself
         run: |
-          HASH=$(./mars --replay data/sample.repl --hours 500 --hash-only | sed -n 's/STATE_HASH=//p')
+          mkdir -p data
+          ./mars --record data/sample.repl --hours 1
+      - name: Run replay & capture hash
+        id: hash
+        shell: bash
+        run: |
+          OUT=$(./mars --replay data/sample.repl --hours 500 --hash-only || true)
+          HASH=$(printf "%s\n" "$OUT" | sed -n 's/^STATE_HASH=//p' | head -n1)
+          if [ -z "$HASH" ]; then
+            echo "Game output:"
+            echo "$OUT"
+            echo "ERROR: STATE_HASH not found"
+            exit 1
+          fi
           echo "hash=$HASH" >> "$GITHUB_OUTPUT"
 
   windows:
     runs-on: windows-latest
     outputs:
-      hash: ${{ steps.run.outputs.hash }}
+      hash: ${{ steps.hash.outputs.hash }}
     steps:
       - uses: actions/checkout@v4
       - name: MSVC Dev Cmd
@@ -27,11 +39,24 @@ jobs:
         with: { arch: x64 }
       - name: Build (MSVC)
         shell: cmd
-        run: cl /nologo /EHsc /std:c++17 /O2 /W4 /Fe:mars.exe mars_colony.cpp
-      - name: Run replay & hash
-        id: run
-        shell: cmd
-        run: for /f "tokens=2 delims==" %%A in ('mars.exe --replay data\sample.repl --hours 500 --hash-only ^| find "STATE_HASH"') do echo hash=%%A >> %GITHUB_OUTPUT%
+        run: cl /nologo /EHsc /std:c++17 /O2 /W4 /I src /Fe:mars.exe mars_colony.cpp
+      - name: Make sample replay using the game itself
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path data | Out-Null
+          .\mars.exe --record data\sample.repl --hours 1
+      - name: Run replay & capture hash
+        id: hash
+        shell: pwsh
+        run: |
+          $out  = & .\mars.exe --replay data\sample.repl --hours 500 --hash-only
+          $line = $out | Select-String -Pattern '^STATE_HASH=' | Select-Object -First 1
+          if ($null -eq $line) {
+            Write-Host "Game output:`n$out"
+            throw "STATE_HASH not found"
+          }
+          $hash = $line.Line.Split('=')[1]
+          "hash=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
   compare:
     needs: [linux, windows]
