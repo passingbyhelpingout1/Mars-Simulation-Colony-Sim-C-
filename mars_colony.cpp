@@ -3,7 +3,7 @@
 //
 // CI contract:
 //   mars.exe --replay <file> --hours <N> --hash-only
-//     -> prints exactly:  STATE_HASH <16-digit UPPERCASE HEX>\n  and exits 0.
+//     -> prints exactly:  STATE_HASH=<16-digit UPPERCASE HEX>\n  and exits 0.
 //
 // Windows fix:
 //   Put stdout/stderr into BINARY mode so '\n' is not translated to '\r\n',
@@ -18,7 +18,11 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include <inttypes.h> // PRIX64
+
+#ifndef __STDC_FORMAT_MACROS
+#define __STDC_FORMAT_MACROS 1
+#endif
+#include <cinttypes> // PRIX64, PRIu64
 
 #ifdef _WIN32
   #include <io.h>
@@ -263,7 +267,7 @@ static int run_headless(const Options& opt) {
     const uint64_t hash = world_checksum(w);
 
     if (opt.hash_only) {
-        std::printf("STATE_HASH %016" PRIX64 "\n", hash);
+        std::printf("STATE_HASH=%016" PRIX64 "\n", static_cast<std::uint64_t>(hash));
         std::fflush(stdout);
     } else {
         std::cout << "Ticks: " << opt.ticks
@@ -271,7 +275,7 @@ static int run_headless(const Options& opt) {
                   << "  CO2=" << w.co2_mg << "mg"
                   << "  T=" << w.temp_milK << " mK"
                   << "  P=" << w.power_mW << " mW\n";
-        std::printf("STATE_HASH %016" PRIX64 "\n", hash);
+        std::printf("STATE_HASH=%016" PRIX64 "\n", static_cast<std::uint64_t>(hash));
         std::fflush(stdout);
     }
     return 0;
@@ -290,8 +294,10 @@ static int run_interactive() {
             step(w);
             std::cout << "tick=" << w.tick << " (stepped)\n";
         } else if (cmd == "s" || cmd == "status") {
-            std::printf("tick=%" PRIu64 " O2=%dmg CO2=%dmg T=%dmK P=%dmW  STATE_HASH %016" PRIX64 "\n",
-                        w.tick, w.oxygen_mg, w.co2_mg, w.temp_milK, w.power_mW, world_checksum(w));
+            std::printf("tick=%" PRIu64 " O2=%dmg CO2=%dmg T=%dmK P=%dmW  STATE_HASH=%016" PRIX64 "\n",
+                        static_cast<std::uint64_t>(w.tick),
+                        w.oxygen_mg, w.co2_mg, w.temp_milK, w.power_mW,
+                        static_cast<std::uint64_t>(world_checksum(w)));
             std::fflush(stdout);
         } else {
             std::cout << "unknown command: " << cmd << "\n";
@@ -306,7 +312,8 @@ int run(int argc, char** argv) {
 
     if (!opt.ok) {
         if (headless_requested && opt.hash_only) {
-            std::printf("STATE_HASH %016" PRIX64 "\n", 0ULL);
+            std::uint64_t zero = 0;
+            std::printf("STATE_HASH=%016" PRIX64 "\n", zero);
             std::fflush(stdout);
             return 0;
         }
