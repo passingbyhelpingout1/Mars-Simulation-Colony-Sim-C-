@@ -83,6 +83,30 @@ static string readLine(const string& prompt, const string& defValue) {
     return line;
 }
 
+// ----------- Typed log / Step options (message bus) --------------------------
+
+enum class LogKind { Info, Warning, Event, Weather, Order };
+
+struct LogMsg {
+    LogKind kind;
+    string  text;
+};
+
+using LogSink = std::function<void(const LogMsg&)>;
+
+static void console_sink(const LogMsg& m) { cout << m.text << '\n'; }
+static void null_sink(const LogMsg&) {}
+
+struct StepOpts {
+    bool     spawn_random_events = true; // forecast sets false
+    bool     quiet               = false; // for subsystems that only accept bool quiet
+    LogSink  sink                = console_sink;
+};
+
+static inline void emit(const StepOpts& opt, LogKind k, const string& s) {
+    if (opt.sink) opt.sink(LogMsg{k, s});
+}
+
 // ----------- Hashing (deterministic state digest) ----------------------------
 
 static uint64_t fnv1a64(const void* data, size_t len) {
@@ -264,7 +288,7 @@ public:
     // Enable/disable throwing on invariant failures each simulated hour.
     void enableHardInvariants(bool on) { hardFailOnInvariant = on; }
 
-    // Quiet mode (reuses forecastMode to suppress logs safely without changing sim).
+    // Quiet mode (reuses forecastMode to suppress ONLY non-core logs; core sim uses StepOpts).
     void setSilentMode(bool on) { forecastMode = on; }
 
     // Deterministic state hash (64-bit FNV-1a over canonical serialization).
@@ -332,11 +356,14 @@ public:
         g.enableHardInvariants(true);
         g.setSeed(123456789u);
 
+        // Quiet StepOpts for orders in self-test
+        StepOpts q; q.quiet = true; q.sink = null_sink;
+
         // 1) Advance and place a couple of buildings deterministically.
         g.advanceHours(24);
-        g.queueBuildNow(BuildingType::SolarArray);
+        g.queueBuildNow(BuildingType::SolarArray, q);
         g.advanceHours(48);
-        g.queueBuildNow(BuildingType::BatteryBank);
+        g.queueBuildNow(BuildingType::BatteryBank, q);
         g.advanceHours(24);
 
         // 2) Forecast must be non-destructive (state unchanged afterwards).
@@ -636,13 +663,20 @@ public:
     // Expose advancing time for headless/autorun
     void advanceHours(int hours) {
         hours = std::max(0, hours);
+
+        // Core step options: when in silent/forecast mode, suppress core logs
+        StepOpts opt;
+        opt.spawn_random_events = true;
+        opt.quiet = forecastMode;
+        opt.sink  = forecastMode ? null_sink : console_sink;
+
         for (int i = 0; i < hours; ++i) {
             // Apply all commands scheduled for THIS hour before events/simulation
-            applyCommandsForHour(s.hour);
+            applyCommandsForHour(s.hour, opt);
 
-            maybeSpawnEvents();
-            simulateHour();
-            tickEffects();
+            // Random events and sim driven inside simulateHour(opt)
+            simulateHour(opt);
+            tickEffects(opt);
 
             // Lightweight invariant check each hour (throws if enabled)
             if (!checkInvariants(false) && hardFailOnInvariant) {
@@ -659,7 +693,7 @@ public:
 
 private:
     GameState s;
-    bool forecastMode = false; // also used as quiet/log-suppression mode for headless runs
+    bool forecastMode = false; // used for outer/CLI logs; core sim uses StepOpts.quiet/sink
 
     // Invariant behavior
     bool hardFailOnInvariant = false;
@@ -690,8 +724,8 @@ private:
         }
     }
 
-    // Apply all commands scheduled for the given hour.
-    void applyCommandsForHour(long long hourNow) {
+    // Apply all commands scheduled for the given hour (logs via StepOpts.sink).
+    void applyCommandsForHour(long long hourNow, const StepOpts& opt) {
         auto range = pendingCommands.equal_range(hourNow);
         for (auto it = range.first; it != range.second; ++it) {
             const Command& c = it->second;
@@ -699,22 +733,19 @@ private:
                 case CommandType::Build: {
                     BuildingType bt = static_cast<BuildingType>(c.a);
                     bool ok = tryBuild(bt);
-                    if (!forecastMode) {
-                        if (ok) cout << "[Order] Build " << to_string(bt) << " completed at start of hour " << hourNow << ".\n";
-                        else    cout << "[Order] Build " << to_string(bt) << " FAILED (resources insufficient) at hour " << hourNow << ".\n";
-                    }
+                    if (ok) emit(opt, LogKind::Order, "[Order] Build " + to_string(bt) + " completed at start of hour " + std::to_string(hourNow) + ".");
+                    else    emit(opt, LogKind::Order, "[Order] Build " + to_string(bt) + " FAILED (resources insufficient) at hour " + std::to_string(hourNow) + ".");
                 } break;
             }
         }
         pendingCommands.erase(range.first, range.second);
     }
 
-    // Queue from UI and apply immediately this hour (so behavior matches old build flow).
-    void queueBuildNow(BuildingType t) {
+    // Queue from UI and apply immediately this hour (keeps UX same as before and ensures recording)
+    void queueBuildNow(BuildingType t, const StepOpts& opt = StepOpts{}) {
         Command c; c.hour = s.hour; c.type = CommandType::Build; c.a = static_cast<int>(t);
         submit(c);
-        // Apply instantly for current hour (keeps UX same as before and ensures recording)
-        applyCommandsForHour(s.hour);
+        applyCommandsForHour(s.hour, opt);
     }
 
     void initStarter() {
@@ -896,8 +927,8 @@ private:
         }
 
         // Route through deterministic command system (+record if enabled)
-        queueBuildNow(chosen);
-        // The command executor prints success/failure. Nothing else needed here.
+        queueBuildNow(chosen); // default StepOpts prints via console_sink
+        // The command executor logs success/failure via message bus.
     }
 
     bool tryBuild(BuildingType t) {
@@ -920,7 +951,8 @@ private:
 
     // ---- Random Events ------------------------------------------------------
 
-    void maybeSpawnEvents() {
+    void maybeSpawnEvents(const StepOpts& opt) {
+        if (!opt.spawn_random_events) return;
         if (hourOfSol() != 0) return;
         std::uniform_real_distribution<double> U(0.0, 1.0);
 
@@ -934,7 +966,7 @@ private:
             e.solarMultiplier = mult(s.rng);
             e.description = "Dust Storm (solar " + std::to_string(int(e.solarMultiplier*100)) + "%)";
             s.effects.push_back(e);
-            if (!forecastMode) cout << "[Event] A dust storm rolls in! Solar output reduced.\n";
+            emit(opt, LogKind::Weather, "[Event] A dust storm rolls in! Solar output reduced.");
         }
 
         // Meteoroid (6%): destroy a random non-battery building
@@ -948,7 +980,7 @@ private:
                 std::uniform_int_distribution<int> pick(0, (int)candidates.size()-1);
                 int idx = candidates[pick(s.rng)];
                 auto btype = s.buildings[idx].type;
-                if (!forecastMode) cout << "[Event] Meteoroid strike! " << to_string(btype) << " destroyed.\n";
+                emit(opt, LogKind::Event, "[Event] Meteoroid strike! " + to_string(btype) + " destroyed.");
                 const auto& sp = getSpec(btype);
                 s.housingCapacity -= sp.housing;
                 s.housingCapacity = std::max(s.housingCapacity, 0);
@@ -964,16 +996,16 @@ private:
             s.res.food   += 80.0;
             s.res.metals += 60;
             s.res.credits+= 400;
-            if (!forecastMode) cout << "[Event] Orbital supply drop delivered! Stocks replenished.\n";
+            emit(opt, LogKind::Event, "[Event] Orbital supply drop delivered! Stocks replenished.");
         }
     }
 
-    void tickEffects() {
+    void tickEffects(const StepOpts& opt) {
         for (auto& e : s.effects) {
             if (e.hoursRemaining > 0) --e.hoursRemaining;
         }
-        // Proper pruning and quiet logging when forecastMode (quiet) is enabled.
-        effects::pruneExpiredEffects(s.effects, forecastMode);
+        // Proper pruning, with quiet control driven by StepOpts.quiet
+        effects::pruneExpiredEffects(s.effects, opt.quiet);
     }
 
     // ---- Non-critical dispatch optimizer (0/1 knapsack) --------------------
@@ -1046,8 +1078,6 @@ private:
         hours = std::max(0, hours);
         auto backup = s;
         auto cmdBackup = pendingCommands;   // include scheduled orders in look-ahead
-        const bool oldFM = forecastMode;
-        forecastMode = true;
 
         vector<double> batt, prod, crit, noncritRun, battIn, battOut;
         vector<int>    solv, hourv;
@@ -1056,13 +1086,19 @@ private:
         noncritRun.reserve(hours); battIn.reserve(hours); battOut.reserve(hours);
         solv.reserve(hours); hourv.reserve(hours); blackout.reserve(hours);
 
+        // Silent, deterministic step options for forecast
+        StepOpts fopt;
+        fopt.spawn_random_events = false;
+        fopt.quiet = true;
+        fopt.sink  = null_sink;
+
         for (int i = 0; i < hours; ++i) {
             // Apply any orders due at this forecast hour (non-destructive; we restore later)
-            applyCommandsForHour(s.hour);
+            applyCommandsForHour(s.hour, fopt);
 
-            // Do NOT spawn new random events during forecast
-            simulateHour();
-            tickEffects();
+            // Do NOT spawn new random events during forecast (enforced by fopt)
+            simulateHour(fopt);
+            tickEffects(fopt);
             ++s.hour;
 
             batt.push_back(s.res.powerStored);
@@ -1077,7 +1113,6 @@ private:
         }
 
         // Restore state + command queue
-        forecastMode = oldFM;
         s = std::move(backup);
         pendingCommands = std::move(cmdBackup);
 
@@ -1114,9 +1149,15 @@ private:
         }
     }
 
-    // ---- Power & resource update -------------------------------------------
+    // ---- Power & resource update (PURE, via StepOpts) -----------------------
 
-    void simulateHour() {
+    // **simulateHour suggestion implemented here**:
+    // - accepts StepOpts (spawn_random_events, quiet, sink)
+    // - never prints directly; all messages go through emit(opt, ...)
+    void simulateHour(const StepOpts& opt) {
+        // 0) Random events (if any)
+        maybeSpawnEvents(opt);
+
         // 1) Power production
         double producers = 0.0;
         double daylight = daylightFactor();
@@ -1289,13 +1330,14 @@ private:
             : 0.0;
         s.lastPower.blackout = blackout;
 
-        // 12) Warnings
-        if (!forecastMode && (s.res.oxygen <= 0.0 || s.res.food <= 0.0 || s.res.water <= 0.0)) {
-            cout << "[Warning] Critical shortage: ";
-            if (s.res.oxygen <= 0.0) cout << "Oxygen ";
-            if (s.res.water  <= 0.0) cout << "Water ";
-            if (s.res.food   <= 0.0) cout << "Food ";
-            cout << "!\n";
+        // 12) Warnings (via message bus)
+        if (s.res.oxygen <= 0.0 || s.res.food <= 0.0 || s.res.water <= 0.0) {
+            string w = "[Warning] Critical shortage: ";
+            if (s.res.oxygen <= 0.0) w += "Oxygen ";
+            if (s.res.water  <= 0.0) w += "Water ";
+            if (s.res.food   <= 0.0) w += "Food ";
+            w += "!";
+            emit(opt, LogKind::Warning, w);
         }
     }
 
@@ -1430,7 +1472,7 @@ int main(int argc, char** argv) {
 
         // --- CI hash-only mode: run quietly and print STATE_HASH then exit ---
         if (hashOnlyFlag) {
-            g.setSilentMode(true); // suppress logs safely
+            g.setSilentMode(true); // suppress non-core logs
             if (autorunHours > 0) {
                 g.advanceHours((int)autorunHours);
             }
