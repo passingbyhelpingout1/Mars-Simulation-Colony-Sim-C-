@@ -1,0 +1,28 @@
+name: build
+on:
+  push:
+  pull_request:
+
+jobs:
+  cmake:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (Release)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release -- -j 2
+
+      - name: Upload artifact (all OS)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mars_colony-${{ runner.os }}
+          path: |
+            build/Release/mars_colony.exe
+            build/mars_colony
