@@ -9,6 +9,12 @@
    • Deterministic save/load (versioned text format) + reproducible RNG seeds.
    • Discrete non-critical power dispatch via a tiny 0/1 knapsack optimizer.
 
+  NEW in this build:
+   • Physically-plausible battery model with C-rate limits and round-trip efficiency.
+   • Save/Load v2 (backward compatible with v1) to persist new battery parameters.
+   • Power forecast shows scheduled charge/discharge totals.
+   • Status panel shows battery model parameters.
+
   Build (MinGW-w64 g++):
     g++ -std=c++17 -O2 -Wall -Wextra -o MarsColony.exe mars_colony.cpp
 */
@@ -27,6 +33,7 @@
 #include <fstream>
 #include <cstdint>
 #include <cmath>
+#include <numeric>
 
 using std::cout;
 using std::cin;
@@ -141,8 +148,14 @@ struct LastPowerReport {
     double producers = 0.0;
     double criticalDemand = 0.0;
     double nonCriticalDemand = 0.0;
-    double nonCriticalEff = 0.0; // 0..1 (share of non-critical demand actually run)
+    double nonCriticalEff = 0.0; // share of non-critical demand actually run [0..1]
     bool blackout = false;
+
+    // NEW: battery telemetry for the last simulated hour
+    double battIn  = 0.0; // kWh taken from producers into the battery (charge input energy)
+    double battOut = 0.0; // kWh delivered from battery to loads (after discharge efficiency)
+    bool   chargeCRateLimited    = false;
+    bool   dischargeCRateLimited = false;
 };
 
 // ----------- Specs database --------------------------------------------------
@@ -180,6 +193,11 @@ struct GameState {
     vector<ActiveEffect> effects;
     LastPowerReport lastPower;
 
+    // NEW: Battery model parameters (tunable)
+    double batteryCRate  = 0.50; // per-hour C-rate (0.5C -> can move 0.5 * capacity per hour)
+    double batteryEtaIn  = 0.92; // charge efficiency
+    double batteryEtaOut = 0.95; // discharge efficiency
+
     std::mt19937 rng;
     uint32_t rngSeed = 0; // recorded for reproducibility
 
@@ -195,6 +213,8 @@ struct GameState {
         }
         rngSeed = static_cast<uint32_t>(seed);
         rng.seed(seed);
+
+        // (explicit defaults already set above)
     }
 };
 
@@ -211,7 +231,8 @@ public:
         std::ofstream ofs(path, std::ios::out);
         if (!ofs) { cout << "Failed to open '" << path << "' for writing.\n"; return false; }
 
-        ofs << "MARS_SAVE 1\n";
+        // Bump to v2 for battery parameters
+        ofs << "MARS_SAVE 2\n";
         ofs << "hour " << s.hour << "\n";
         ofs << "population " << s.population << "\n";
         ofs << "housing " << s.housingCapacity << "\n";
@@ -236,6 +257,9 @@ public:
             << " " << s.lastPower.nonCriticalDemand << " " << s.lastPower.nonCriticalEff
             << " " << (s.lastPower.blackout ? 1 : 0) << "\n";
 
+        // NEW in v2: persist battery model parameters
+        ofs << "battery " << s.batteryCRate << " " << s.batteryEtaIn << " " << s.batteryEtaOut << "\n";
+
         ofs << "rngseed " << s.rngSeed << "\n";
         std::ostringstream rngoss;
         rngoss << s.rng;
@@ -250,7 +274,7 @@ public:
         if (!ifs) { cout << "Failed to open '" << path << "' for reading.\n"; return false; }
 
         string tag; int version = 0;
-        if (!(ifs >> tag >> version) || tag != "MARS_SAVE" || version != 1) {
+        if (!(ifs >> tag >> version) || tag != "MARS_SAVE" || (version != 1 && version != 2)) {
             cout << "Unrecognized save file header.\n"; return false;
         }
 
@@ -305,6 +329,10 @@ public:
                     >> loaded.lastPower.nonCriticalDemand >> loaded.lastPower.nonCriticalEff
                     >> blackoutInt;
                 loaded.lastPower.blackout = (blackoutInt!=0);
+                ifs.ignore(1, '\n');
+            } else if (key == "battery") {
+                // Present only in v2 saves
+                ifs >> loaded.batteryCRate >> loaded.batteryEtaIn >> loaded.batteryEtaOut;
                 ifs.ignore(1, '\n');
             } else if (key == "rngseed") {
                 unsigned seed=0; ifs >> seed; loaded.rngSeed = seed; ifs.ignore(1, '\n');
@@ -460,6 +488,13 @@ private:
              << " @eff " << (100.0 * s.lastPower.nonCriticalEff) << "%";
         if ( s.lastPower.blackout ) cout << "  [BLACKOUT]";
         cout << "\n";
+
+        // NEW: show battery model params and last-hour battery flows
+        cout << "Battery model: C=" << std::setprecision(2) << s.batteryCRate
+             << "  eta_in=" << s.batteryEtaIn
+             << "  eta_out=" << s.batteryEtaOut
+             << "  | last hour: +in " << std::setprecision(1) << s.lastPower.battIn
+             << "  -out " << s.lastPower.battOut << " (kWh)\n";
 
         cout << "Water: "  << s.res.water  << "  "
              << "Oxygen: " << s.res.oxygen << "  "
@@ -708,11 +743,12 @@ private:
         const bool oldFM = forecastMode;
         forecastMode = true;
 
-        vector<double> batt, prod, crit, noncritRun;
+        vector<double> batt, prod, crit, noncritRun, battIn, battOut;
         vector<int>    solv, hourv;
         vector<char>   blackout;
         batt.reserve(hours); prod.reserve(hours); crit.reserve(hours);
-        noncritRun.reserve(hours); solv.reserve(hours); hourv.reserve(hours); blackout.reserve(hours);
+        noncritRun.reserve(hours); battIn.reserve(hours); battOut.reserve(hours);
+        solv.reserve(hours); hourv.reserve(hours); blackout.reserve(hours);
 
         for (int i = 0; i < hours; ++i) {
             // Do NOT spawn new random events during forecast
@@ -724,6 +760,8 @@ private:
             prod.push_back(s.lastPower.producers);
             crit.push_back(s.lastPower.criticalDemand);
             noncritRun.push_back(s.lastPower.nonCriticalDemand * s.lastPower.nonCriticalEff);
+            battIn.push_back(s.lastPower.battIn);
+            battOut.push_back(s.lastPower.battOut);
             blackout.push_back(s.lastPower.blackout ? 1 : 0);
             solv.push_back(static_cast<int>(s.hour / SOL_HOURS));
             hourv.push_back(static_cast<int>(s.hour % SOL_HOURS));
@@ -738,6 +776,8 @@ private:
         double maxBat = *std::max_element(batt.begin(), batt.end());
         int firstBO = -1;
         for (int i = 0; i < hours; ++i) if (blackout[i]) { firstBO = i; break; }
+        double sumIn  = std::accumulate(battIn.begin(),  battIn.end(),  0.0);
+        double sumOut = std::accumulate(battOut.begin(), battOut.end(), 0.0);
 
         cout << "\n=== Power Forecast (" << hours << "h) ===\n";
         cout << "Battery range: " << std::fixed << std::setprecision(1)
@@ -748,6 +788,8 @@ private:
         } else {
             cout << "No blackout predicted.\n";
         }
+        cout << "Charge scheduled: " << std::setprecision(1) << sumIn
+             << " kWh, Discharge scheduled: " << sumOut << " kWh\n";
 
         cout << "\nhr  sol:hr  prod  crit  noncrit  batt  note\n";
         for (int i = 0; i < hours; i += 6) {
@@ -777,19 +819,19 @@ private:
             if (sp.powerProdDay   > 0.0) producers += sp.powerProdDay * daylight * stormMult;
         }
 
-        // 2) Consumption
+        // 2) Consumption — aggregate critical vs non-critical potential demand
         double critical = s.population * PWR_PER_COLONIST;
-        double noncrit = 0.0;
+        double noncritPotential = 0.0;
 
         for (const auto& b : s.buildings) {
             if (!b.active) continue;
             const auto& sp = getSpec(b.type);
             if (sp.powerCons <= 0.0 || !sp.needsPower) continue;
             if (sp.isCriticalLoad) critical += sp.powerCons;
-            else                   noncrit  += sp.powerCons;
+            else                   noncritPotential  += sp.powerCons;
         }
 
-        // Shortage-aware weights (smaller hours-of-supply => larger weight).
+        // 3) Shortage-aware weights (smaller hours-of-supply => larger weight).
         auto hoursOf = [&](double store, double ratePerHour){
             if (ratePerHour <= 0.0) return 9999.0;
             return (store / ratePerHour);
@@ -806,27 +848,79 @@ private:
         double wWater = weightFromHours(hWater_before);
         double wO2    = weightFromHours(hO2_before);
 
-        // 3) Allocate power/battery using discrete ON/OFF dispatch for non-critical loads
-        double availableForNoncrit = s.res.powerStored + producers - critical;
-        bool blackout = (availableForNoncrit < 0.0);
+        // 4) Determine budget for non-critical loads, respecting battery C-rate
+        const double cap    = s.res.batteryCapacity;
+        const double soc0   = s.res.powerStored;
+        const double cRate  = s.batteryCRate;
+        const double etaIn  = s.batteryEtaIn;
+        const double etaOut = s.batteryEtaOut;
 
+        const double deliverByCRate = cap * cRate;      // kWh this hour
+        const double deliverBySoC   = soc0 * etaOut;    // kWh this hour
+        const double deliverableMax = std::max(0.0, std::min(deliverByCRate, deliverBySoC));
+
+        const double surplusAfterCritical = std::max(0.0, producers - critical);
+        const double deficitAfterCritical = std::max(0.0, critical - producers);
+
+        const double reservedForCritical = std::min(deficitAfterCritical, deliverableMax);
+        const double remainingDeliverable = std::max(0.0, deliverableMax - reservedForCritical);
+
+        const double nonCritBudget = surplusAfterCritical + remainingDeliverable;
+
+        // 5) Choose which non-critical loads to run under that budget
         std::vector<char> runFlags(s.buildings.size(), 0);
         double noncritUsed = 0.0;
-
-        if (!blackout) {
-            auto chosen = chooseNonCriticalLoads(availableForNoncrit, wFood, wO2, wWater);
+        if (nonCritBudget > 0.0) {
+            auto chosen = chooseNonCriticalLoads(nonCritBudget, wFood, wO2, wWater);
             for (int idx : chosen) {
                 runFlags[idx] = 1;
                 noncritUsed += getSpec(s.buildings[idx].type).powerCons;
             }
         }
 
-        // Compute battery change from chosen dispatch (no negative battery, but record blackout if critical unmet)
-        double used = critical + noncritUsed;
-        s.res.powerStored += (producers - used);
-        s.res.powerStored = clampv(s.res.powerStored, 0.0, s.res.batteryCapacity);
+        // 6) Battery dispatch with C-rate limits and round-trip efficiency
+        // Net after selected loads (positive -> surplus to charge; negative -> need discharge)
+        double netAfterLoads = producers - critical - noncritUsed;
 
-        // 4) Resource flows from buildings (gated by power and dispatch)
+        // Reset last-hour battery telemetry
+        s.lastPower.battIn  = 0.0;
+        s.lastPower.battOut = 0.0;
+        s.lastPower.chargeCRateLimited    = false;
+        s.lastPower.dischargeCRateLimited = false;
+
+        double soc = soc0;
+        const double chargePowerLimit    = cap * cRate;
+        const double dischargePowerLimit = cap * cRate;
+
+        if (netAfterLoads > 1e-9) {
+            // Surplus -> charge (limited by C-rate and free space / etaIn)
+            const double byCRate = chargePowerLimit;
+            const double byRoom  = (cap - soc) / std::max(1e-12, etaIn);
+            const double canInput = std::max(0.0, std::min({ netAfterLoads, byCRate, byRoom }));
+            if (canInput < netAfterLoads - 1e-9 && canInput < byCRate - 1e-9) {
+                s.lastPower.chargeCRateLimited = true;
+            }
+            soc += canInput * etaIn;     // store after charge losses
+            s.lastPower.battIn = canInput;   // producers -> battery
+            netAfterLoads -= canInput;   // remainder is curtailed (unused)
+        } else if (netAfterLoads < -1e-9) {
+            // Deficit -> discharge (limited by C-rate and SoC * etaOut)
+            double deficit = -netAfterLoads;
+            const double deliverByCR = dischargePowerLimit;
+            const double deliverBySo = soc * etaOut;
+            const double delivered   = std::max(0.0, std::min({ deficit, deliverByCR, deliverBySo }));
+            if (delivered < deficit - 1e-9 && delivered < deliverByCR - 1e-9) {
+                s.lastPower.dischargeCRateLimited = true;
+            }
+            soc -= delivered / std::max(1e-12, etaOut); // remove pre-efficiency energy from SoC
+            s.lastPower.battOut = delivered;            // energy delivered to bus
+            netAfterLoads += delivered;
+        }
+
+        s.res.powerStored = clampv(soc, 0.0, cap);
+        bool blackout = (netAfterLoads < -1e-6); // still negative after max discharge
+
+        // 7) Resource flows from buildings (gated by power and dispatch)
         double waterDelta  = 0.0;
         double oxygenDelta = 0.0;
         double foodDelta   = 0.0;
@@ -840,7 +934,7 @@ private:
             double eff = 1.0;
             if (sp.needsPower) {
                 if (sp.isCriticalLoad) eff = blackout ? 0.0 : 1.0;
-                else                   eff = runFlags[i] ? 1.0 : 0.0; // discrete ON/OFF
+                else                   eff = (!blackout && runFlags[i]) ? 1.0 : 0.0; // discrete ON/OFF + blackout gating
             }
 
             waterDelta  += sp.waterFlow  * eff;
@@ -848,17 +942,17 @@ private:
             foodDelta   += sp.foodFlow   * eff;
         }
 
-        // 5) Population consumption
+        // 8) Population consumption
         waterDelta  -= s.population * WAT_PER_COLONIST;
         oxygenDelta -= s.population * O2_PER_COLONIST;
         foodDelta   -= s.population * FOOD_PER_COLONIST;
 
-        // 6) Apply
+        // 9) Apply
         s.res.water  = std::max(0.0, s.res.water  + waterDelta);
         s.res.oxygen = std::max(0.0, s.res.oxygen + oxygenDelta);
         s.res.food   = std::max(0.0, s.res.food   + foodDelta);
 
-        // 7) Morale
+        // 10) Morale
         double moraleDelta = 0.0;
         double hFood  = hoursOf(s.res.food,   s.population * FOOD_PER_COLONIST);
         double hWater = hoursOf(s.res.water,  s.population * WAT_PER_COLONIST);
@@ -875,14 +969,17 @@ private:
         if (s.population > s.housingCapacity) moraleDelta -= 0.02;
         s.morale = clampv(s.morale + moraleDelta, 0.0, 1.0);
 
-        // 8) Power report
+        // 11) Power report
         s.lastPower.producers = producers;
         s.lastPower.criticalDemand = critical;
-        s.lastPower.nonCriticalDemand = noncrit;
-        s.lastPower.nonCriticalEff = (noncrit > 0.0) ? (noncritUsed / noncrit) : 0.0; // share of non-crit demand we ran
+        s.lastPower.nonCriticalDemand = noncritPotential;
+        // If there was a blackout, treat non-critical as not effectively served
+        s.lastPower.nonCriticalEff = (noncritPotential > 0.0)
+            ? ( (blackout ? 0.0 : (noncritUsed / noncritPotential)) )
+            : 0.0;
         s.lastPower.blackout = blackout;
 
-        // 9) Warnings
+        // 12) Warnings
         if (!forecastMode && (s.res.oxygen <= 0.0 || s.res.food <= 0.0 || s.res.water <= 0.0)) {
             cout << "[Warning] Critical shortage: ";
             if (s.res.oxygen <= 0.0) cout << "Oxygen ";
