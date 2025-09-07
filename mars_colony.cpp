@@ -2,12 +2,19 @@
 // Deterministic headless runner + interactive fallback.
 //
 // CI contract:
-//   mars.exe --replay <file> --hours <N> --hash-only
+//   mars --replay <file> --hours <N> --hash-only
 //     -> prints exactly:  STATE_HASH=<16-digit UPPERCASE HEX>\n  and exits 0.
 //
+// Notes:
+// - This file is self-contained and intentionally isolated from the rest of the
+//   project's app/cli code to avoid ODR/linker conflicts when the repository
+//   contains multiple experimental mains/CLIs.
+// - It only provides a real 'main' when MARS_DETERMINISM_STANDALONE=1 is defined.
+//   Otherwise, it compiles as a utility TU with no entry point and no symbol
+//   collisions (namespace 'mars::detcli').
+//
 // Windows fix:
-//   Put stdout/stderr into BINARY mode so '\n' is not translated to '\r\n',
-//   preventing PowerShell regex anchors from failing on the trailing '\r'.
+//   Put stdout/stderr into BINARY mode so '\n' is not translated to "\r\n".
 
 #include <algorithm>
 #include <cstdint>
@@ -29,23 +36,26 @@
   #include <fcntl.h>
 #endif
 
-namespace mars { namespace cli { int run(int argc, char** argv); } }
+#ifndef MARS_DETERMINISM_STANDALONE
+#define MARS_DETERMINISM_STANDALONE 0
+#endif
 
-#ifndef MARS_HAS_EXTERNAL_CLI
-namespace mars { namespace cli {
+namespace mars { namespace detcli { int run(int argc, char** argv); } }
+
+namespace mars { namespace detcli {
 
 // ---------- FNV-1a 64-bit with helpers ----------
-static constexpr uint64_t FNV_OFFSET_BASIS = 1469598103934665603ULL;
-static constexpr uint64_t FNV_PRIME        = 1099511628211ULL;
+static constexpr std::uint64_t FNV_OFFSET_BASIS = 1469598103934665603ULL;
+static constexpr std::uint64_t FNV_PRIME        = 1099511628211ULL;
 
-static inline uint64_t fnv1a64_update(uint64_t h, const void* data, size_t n) {
+static inline std::uint64_t fnv1a64_update(std::uint64_t h, const void* data, size_t n) {
     const unsigned char* p = static_cast<const unsigned char*>(data);
     for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= FNV_PRIME; }
     return h;
 }
 
 // Canonical little-endian updates (cross-arch stable).
-static inline uint64_t fnv1a64_u32_le(uint64_t h, uint32_t v) {
+static inline std::uint64_t fnv1a64_u32_le(std::uint64_t h, std::uint32_t v) {
     unsigned char b[4] = {
         static_cast<unsigned char>(v & 0xFFu),
         static_cast<unsigned char>((v >> 8)  & 0xFFu),
@@ -54,7 +64,7 @@ static inline uint64_t fnv1a64_u32_le(uint64_t h, uint32_t v) {
     };
     return fnv1a64_update(h, b, 4);
 }
-static inline uint64_t fnv1a64_u64_le(uint64_t h, uint64_t v) {
+static inline std::uint64_t fnv1a64_u64_le(std::uint64_t h, std::uint64_t v) {
     unsigned char b[8] = {
         static_cast<unsigned char>( v        & 0xFFu),
         static_cast<unsigned char>((v >> 8)  & 0xFFu),
@@ -70,15 +80,15 @@ static inline uint64_t fnv1a64_u64_le(uint64_t h, uint64_t v) {
 
 // Stream a file into a hash and also capture a small sample of bytes
 // (first half + last half) for deterministic per-tick mixing.
-static uint64_t hash_file_streaming(const std::string& path,
-                                    std::vector<unsigned char>* sample,
-                                    size_t sample_max = 4096) {
+static std::uint64_t hash_file_streaming(const std::string& path,
+                                         std::vector<unsigned char>* sample,
+                                         size_t sample_max = 4096) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return 0ULL;
 
     const size_t BUF = 64 * 1024;
     std::vector<char> buf(BUF);
-    uint64_t h = FNV_OFFSET_BASIS;
+    std::uint64_t h = FNV_OFFSET_BASIS;
 
     const size_t head_max = sample ? sample_max / 2 : 0;
     const size_t tail_max = sample ? (sample_max - head_max) : 0;
@@ -117,7 +127,7 @@ static uint64_t hash_file_streaming(const std::string& path,
 }
 
 // ---------- Tiny deterministic PRNG ----------
-static inline uint32_t xorshift32(uint32_t& s) {
+static inline std::uint32_t xorshift32(std::uint32_t& s) {
     s ^= (s << 13);
     s ^= (s >> 17);
     s ^= (s << 5);
@@ -126,12 +136,12 @@ static inline uint32_t xorshift32(uint32_t& s) {
 
 // ---------- Simulation state ----------
 struct World {
-    uint64_t tick = 0;     // minute ticks
-    int32_t  oxygen_mg = 20000;
-    int32_t  co2_mg    = 0;
-    int32_t  temp_milK = 293000; // 293 K
-    int32_t  power_mW  = 15000;
-    uint32_t rng       = 0x9E3779B9u; // seed (can be overridden)
+    std::uint64_t tick = 0;     // minute ticks
+    std::int32_t  oxygen_mg = 20000;
+    std::int32_t  co2_mg    = 0;
+    std::int32_t  temp_milK = 293000; // 293 K
+    std::int32_t  power_mW  = 15000;
+    std::uint32_t rng       = 0x9E3779B9u; // seed (can be overridden)
 };
 
 // One minute-tick: purely integer, deterministic.
@@ -141,49 +151,49 @@ static inline void step(World& w) {
     w.co2_mg    += 3;
     w.temp_milK += (w.power_mW >= 12000) ? 1 : -1;
 
-    uint32_t r = xorshift32(w.rng);
+    std::uint32_t r = xorshift32(w.rng);
     int delta  = static_cast<int>(r % 21) - 10; // [-10, +10] mW flicker
     w.power_mW += delta;
     if (w.power_mW < 0) w.power_mW = 0;
 }
 
 // Cross-arch stable checksum (LE canonicalization).
-static uint64_t world_checksum(const World& w) {
-    uint64_t h = FNV_OFFSET_BASIS;
+static std::uint64_t world_checksum(const World& w) {
+    std::uint64_t h = FNV_OFFSET_BASIS;
     h = fnv1a64_u64_le(h, w.tick);
-    h = fnv1a64_u32_le(h, static_cast<uint32_t>(w.oxygen_mg));
-    h = fnv1a64_u32_le(h, static_cast<uint32_t>(w.co2_mg));
-    h = fnv1a64_u32_le(h, static_cast<uint32_t>(w.temp_milK));
-    h = fnv1a64_u32_le(h, static_cast<uint32_t>(w.power_mW));
+    h = fnv1a64_u32_le(h, static_cast<std::uint32_t>(w.oxygen_mg));
+    h = fnv1a64_u32_le(h, static_cast<std::uint32_t>(w.co2_mg));
+    h = fnv1a64_u32_le(h, static_cast<std::uint32_t>(w.temp_milK));
+    h = fnv1a64_u32_le(h, static_cast<std::uint32_t>(w.power_mW));
     h = fnv1a64_u32_le(h, w.rng);
     return h;
 }
 
 // ---------- CLI ----------
 struct Options {
-    std::string replay_path;
-    uint64_t    ticks     = 0;    // authoritative tick count
-    bool        hash_only = false;
-    uint32_t    seed      = 0x9E3779B9u; // default seed
-    bool        headless  = false;
-    bool        ok        = true;
+    std::string   replay_path;
+    std::uint64_t ticks     = 0;    // authoritative tick count
+    bool          hash_only = false;
+    std::uint32_t seed      = 0x9E3779B9u; // default seed
+    bool          headless  = false;
+    bool          ok        = true;
 };
 
-static bool parse_u64(const char* s, uint64_t& out) {
+static bool parse_u64(const char* s, std::uint64_t& out) {
     if (!s || !*s) return false;
     char* end = nullptr;
     unsigned long long v = std::strtoull(s, &end, 10);
     if (end == s || *end != '\0') return false;
-    out = static_cast<uint64_t>(v);
+    out = static_cast<std::uint64_t>(v);
     return true;
 }
-static bool parse_u64_to_u32_seed(const char* s, uint32_t& out) {
-    uint64_t v64 = 0;
+static bool parse_u64_to_u32_seed(const char* s, std::uint32_t& out) {
+    std::uint64_t v64 = 0;
     if (!parse_u64(s, v64)) return false;
-    out = static_cast<uint32_t>((v64 & 0xFFFFFFFFu) ^ (v64 >> 32));
+    out = static_cast<std::uint32_t>((v64 & 0xFFFFFFFFu) ^ (v64 >> 32));
     return true;
 }
-static bool checked_mul(uint64_t a, uint64_t b, uint64_t& out) {
+static bool checked_mul(std::uint64_t a, std::uint64_t b, std::uint64_t& out) {
     if (a == 0 || b == 0) { out = 0; return true; }
     if (a > UINT64_MAX / b) return false;
     out = a * b; return true;
@@ -195,7 +205,7 @@ static Options parse_args(int argc, char** argv) {
         (void)parse_u64_to_u32_seed(env, o.seed);
     }
 
-    uint64_t hours = 0, minutes = 0, ticks = 0;
+    std::uint64_t hours = 0, minutes = 0, ticks = 0;
     bool hours_set = false, minutes_set = false, ticks_set = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -230,7 +240,7 @@ static Options parse_args(int argc, char** argv) {
     } else if (minutes_set) {
         o.ticks = minutes; // 1 tick = 1 minute
     } else if (hours_set) {
-        uint64_t t = 0;
+        std::uint64_t t = 0;
         if (!checked_mul(hours, 60ULL, t)) { o.ok = false; }
         else o.ticks = t;
     }
@@ -241,30 +251,30 @@ static Options parse_args(int argc, char** argv) {
 static void print_usage() {
     std::cout
         << "Usage:\n"
-        << "  mars.exe --replay <file> [--hours N | --minutes N | --ticks N] [--seed S] [--hash-only]\n"
-        << "  mars.exe                     (interactive fallback)\n";
+        << "  mars --replay <file> [--hours N | --minutes N | --ticks N] [--seed S] [--hash-only]\n"
+        << "  mars                     (interactive fallback)\n";
 }
 
 // Headless execution used by CI/automation.
 static int run_headless(const Options& opt) {
     std::vector<unsigned char> sample;
-    uint64_t replay_hash = 0ULL;
+    std::uint64_t replay_hash = 0ULL;
     if (!opt.replay_path.empty()) {
         replay_hash = hash_file_streaming(opt.replay_path, &sample, 4096);
     }
 
     World w{};
-    w.rng = opt.seed ^ static_cast<uint32_t>(replay_hash) ^ static_cast<uint32_t>(replay_hash >> 32);
-    w.oxygen_mg += static_cast<int32_t>(replay_hash & 1023ULL);
-    w.power_mW  += static_cast<int32_t>((replay_hash >> 10) & 2047ULL) - 1024;
+    w.rng = opt.seed ^ static_cast<std::uint32_t>(replay_hash) ^ static_cast<std::uint32_t>(replay_hash >> 32);
+    w.oxygen_mg += static_cast<std::int32_t>(replay_hash & 1023ULL);
+    w.power_mW  += static_cast<std::int32_t>((replay_hash >> 10) & 2047ULL) - 1024;
 
     const size_t wheel = sample.size();
-    for (uint64_t i = 0; i < opt.ticks; ++i) {
+    for (std::uint64_t i = 0; i < opt.ticks; ++i) {
         if (wheel) w.rng ^= sample[static_cast<size_t>(i % wheel)];
         step(w);
     }
 
-    const uint64_t hash = world_checksum(w);
+    const std::uint64_t hash = world_checksum(w);
 
     if (opt.hash_only) {
         std::printf("STATE_HASH=%016" PRIX64 "\n", static_cast<std::uint64_t>(hash));
@@ -325,14 +335,17 @@ int run(int argc, char** argv) {
     return run_interactive();
 }
 
-} } // namespace mars::cli
-#endif // MARS_HAS_EXTERNAL_CLI
+} } // namespace mars::detcli
 
+// Only define a real program entry when explicitly requested.
+// This prevents duplicate 'main' when the repository's other apps are built.
+#if MARS_DETERMINISM_STANDALONE
 int main(int argc, char** argv) {
 #ifdef _WIN32
     // CRLF -> binary mode so '\n' is not auto-translated to "\r\n".
     _setmode(_fileno(stdout), _O_BINARY);
     _setmode(_fileno(stderr), _O_BINARY);
 #endif
-    return mars::cli::run(argc, argv);
+    return mars::detcli::run(argc, argv);
 }
+#endif
