@@ -45,7 +45,7 @@
 #include <stdexcept>
 #include "fixed_clock.h"
 #include "rng.h"
-#include "effects.hpp"  // << added: pruneExpiredEffects(...)
+#include "effects.hpp"  // pruneExpiredEffects(...)
 
 using std::cout;
 using std::cin;
@@ -81,6 +81,18 @@ static string readLine(const string& prompt, const string& defValue) {
     string line;
     if (!std::getline(cin >> std::ws, line) || line.empty()) return defValue;
     return line;
+}
+
+// ----------- Hashing (deterministic state digest) ----------------------------
+
+static uint64_t fnv1a64(const void* data, size_t len) {
+    const unsigned char* p = static_cast<const unsigned char*>(data);
+    uint64_t h = 1469598103934665603ull;      // offset basis
+    for (size_t i = 0; i < len; ++i) {
+        h ^= static_cast<uint64_t>(p[i]);
+        h *= 1099511628211ull;                // FNV prime
+    }
+    return h;
 }
 
 // ----------- Core types ------------------------------------------------------
@@ -251,6 +263,66 @@ public:
 
     // Enable/disable throwing on invariant failures each simulated hour.
     void enableHardInvariants(bool on) { hardFailOnInvariant = on; }
+
+    // Quiet mode (reuses forecastMode to suppress logs safely without changing sim).
+    void setSilentMode(bool on) { forecastMode = on; }
+
+    // Deterministic state hash (64-bit FNV-1a over canonical serialization).
+    uint64_t stateHash64() const {
+        std::ostringstream oss;
+        oss.setf(std::ios::fixed);
+        oss << std::setprecision(17);
+
+        // Core scalar state
+        oss << "hour " << s.hour << "\n";
+        oss << "pop " << s.population << " housing " << s.housingCapacity
+            << " morale " << s.morale << "\n";
+
+        // Resources
+        const auto& r = s.res;
+        oss << "res " << r.powerStored << " " << r.batteryCapacity << " "
+            << r.water << " " << r.oxygen << " " << r.food << " "
+            << r.metals << " " << r.credits << "\n";
+
+        // Battery model
+        oss << "bat " << s.batteryCRate << " " << s.batteryEtaIn << " " << s.batteryEtaOut << "\n";
+
+        // Buildings: count active/inactive by type, sorted by type id
+        std::map<int, std::pair<int,int>> bcounts; // type -> {active,inactive}
+        for (const auto& b : s.buildings) {
+            int t = static_cast<int>(b.type);
+            if (b.active) bcounts[t].first++; else bcounts[t].second++;
+        }
+        for (const auto& kv : bcounts) {
+            oss << "b " << kv.first << " a " << kv.second.first << " i " << kv.second.second << "\n";
+        }
+
+        // Effects: sort by (type, hours, multiplier)
+        struct Eff { int type; int hrs; double mult; };
+        std::vector<Eff> effs;
+        effs.reserve(s.effects.size());
+        for (const auto& e : s.effects) {
+            effs.push_back(Eff{0 /* DustStorm only right now */, e.hoursRemaining, e.solarMultiplier});
+        }
+        std::sort(effs.begin(), effs.end(), [](const Eff& x, const Eff& y){
+            if (x.type != y.type) return x.type < y.type;
+            if (x.hrs  != y.hrs ) return x.hrs  < y.hrs;
+            return x.mult < y.mult;
+        });
+        for (const auto& e : effs) {
+            oss << "e " << e.type << " " << e.hrs << " " << e.mult << "\n";
+        }
+
+        // Last power snapshot (derived, but deterministic given the run)
+        const auto& lp = s.lastPower;
+        oss << "lp " << lp.producers << " " << lp.criticalDemand << " "
+            << lp.nonCriticalDemand << " " << lp.nonCriticalEff << " "
+            << (lp.blackout?1:0) << " " << lp.battIn << " " << lp.battOut << " "
+            << (lp.chargeCRateLimited?1:0) << " " << (lp.dischargeCRateLimited?1:0) << "\n";
+
+        const std::string sig = oss.str();
+        return fnv1a64(sig.data(), sig.size());
+    }
 
     // Run a deterministic, headless self-test for CI.
     // Returns 0 on success, non-zero on failure.
@@ -579,13 +651,15 @@ public:
 
             ++s.hour;
         }
-        cout << "Advanced " << hours << " " << pluralize("hour", hours)
-             << ". Now Sol " << sol() << ", Hour " << hourOfSol() << ".\n";
+        if (!forecastMode) { // quiet when in forecast/quiet mode
+            cout << "Advanced " << hours << " " << pluralize("hour", hours)
+                 << ". Now Sol " << sol() << ", Hour " << hourOfSol() << ".\n";
+        }
     }
 
 private:
     GameState s;
-    bool forecastMode = false; // suppress logs during look-ahead simulations
+    bool forecastMode = false; // also used as quiet/log-suppression mode for headless runs
 
     // Invariant behavior
     bool hardFailOnInvariant = false;
@@ -898,7 +972,7 @@ private:
         for (auto& e : s.effects) {
             if (e.hoursRemaining > 0) --e.hoursRemaining;
         }
-        // Patched: delegate pruning + user-facing log to a single helper.
+        // Proper pruning and quiet logging when forecastMode (quiet) is enabled.
         effects::pruneExpiredEffects(s.effects, forecastMode);
     }
 
@@ -1285,6 +1359,9 @@ int main(int argc, char** argv) {
     bool checkInvariantsFlag = false;
     bool runSelfTestFlag = false;
 
+    // NEW: CI hash-only mode
+    bool hashOnlyFlag = false;
+
     // Parse simple CLI flags
     for (int i = 1; i < argc; ++i) {
         string arg = argv[i];
@@ -1293,6 +1370,11 @@ int main(int argc, char** argv) {
         } else if (arg == "--headless" && i + 1 < argc) {
             autorunHours = std::stoll(argv[++i]);
             headless = true;
+        } else if (arg == "--hours" && i + 1 < argc) {    // alias used by CI
+            autorunHours = std::stoll(argv[++i]);
+        } else if (arg == "--hash-only") {                // CI wants only a STATE_HASH
+            hashOnlyFlag = true;
+            noPause = true; // never prompt
         } else if (arg == "--no-pause") {
             noPause = true;
         } else if (arg == "--seed" && i + 1 < argc) {
@@ -1345,6 +1427,17 @@ int main(int argc, char** argv) {
 
         // Enable hard invariant checking if requested.
         if (checkInvariantsFlag) g.enableHardInvariants(true);
+
+        // --- CI hash-only mode: run quietly and print STATE_HASH then exit ---
+        if (hashOnlyFlag) {
+            g.setSilentMode(true); // suppress logs safely
+            if (autorunHours > 0) {
+                g.advanceHours((int)autorunHours);
+            }
+            const uint64_t H = g.stateHash64();
+            cout << "STATE_HASH=" << std::hex << std::setw(16) << std::setfill('0') << std::nouppercase << H << std::dec << "\n";
+            return 0;
+        }
 
         if (autorunHours > 0) {
             g.advanceHours((int)autorunHours);
