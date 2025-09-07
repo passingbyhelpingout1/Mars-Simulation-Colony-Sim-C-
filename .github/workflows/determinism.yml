@@ -1,0 +1,44 @@
+name: Determinism
+on: [push, pull_request]
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    outputs:
+      hash: ${{ steps.run.outputs.hash }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (GCC)
+        run: g++ -std=c++17 -O2 -Wall -Wextra -o mars mars_colony.cpp
+      - name: Run replay & hash
+        id: run
+        run: |
+          HASH=$(./mars --replay data/sample.repl --hours 500 --hash-only | sed -n 's/STATE_HASH=//p')
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+
+  windows:
+    runs-on: windows-latest
+    outputs:
+      hash: ${{ steps.run.outputs.hash }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: MSVC Dev Cmd
+        uses: ilammy/msvc-dev-cmd@v1
+        with: { arch: x64 }
+      - name: Build (MSVC)
+        shell: cmd
+        run: cl /nologo /EHsc /std:c++17 /O2 /W4 /Fe:mars.exe mars_colony.cpp
+      - name: Run replay & hash
+        id: run
+        shell: cmd
+        run: for /f "tokens=2 delims==" %%A in ('mars.exe --replay data\sample.repl --hours 500 --hash-only ^| find "STATE_HASH"') do echo hash=%%A >> %GITHUB_OUTPUT%
+
+  compare:
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check equality
+        run: |
+          echo "linux:   ${{ needs.linux.outputs.hash }}"
+          echo "windows: ${{ needs.windows.outputs.hash }}"
+          test "${{ needs.linux.outputs.hash }}" = "${{ needs.windows.outputs.hash }}"
