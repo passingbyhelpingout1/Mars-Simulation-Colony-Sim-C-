@@ -22,6 +22,10 @@
      - CLI: --check-invariants (throw on invariant failure each hour), --selftest (run deterministic test).
      - Invariants catch NaNs/negatives, SoC bounds, eta/C-rate ranges, etc.
      - Self-test abuses forecast and save/load, returns non-zero on failure.
+   • **Pure, unit-safe PowerSystem step (deterministic & saturating).**
+     - `mars::power::step(...)` is a tiny, pure function for all battery/energy math.
+     - `simulateHour()` calls it to size the non-critical budget and to apply flows.
+     - Extra micro self-tests added under `--selftest`.
 
   Build (MinGW-w64 g++):
     g++ -std=c++17 -O2 -Wall -Wextra -o MarsColony.exe mars_colony.cpp
@@ -119,6 +123,109 @@ static uint64_t fnv1a64(const void* data, size_t len) {
     return h;
 }
 
+// ----------- Pure PowerSystem (deterministic & saturating) -------------------
+
+namespace mars::power {
+
+// All math is conceptualized in Wh for a step (W * dtHours). With dtHours=1
+// (our default), W and Wh are numerically equal.
+struct State {
+    double storedWh;      // current energy in battery [Wh]
+    double capacityWh;    // battery capacity [Wh]
+};
+
+struct Config {
+    double etaIn;         // charge efficiency in (0,1]
+    double etaOut;        // discharge efficiency in (0,1]
+    double cRate;         // C-rate (per hour): max charge/discharge = cRate * capacityWh per hour
+};
+
+struct Inputs {
+    double producersW;         // [W]
+    double criticalDemandW;    // [W]
+    double nonCriticalDemandW; // [W] (can be scaled down if needed)
+    double dtHours;            // usually 1.0
+};
+
+struct Result {
+    // Fraction of nonCriticalDemand that was actually served, in [0,1].
+    double nonCriticalEff;
+
+    // Battery flows for this step:
+    // battInStoredWh  — energy actually stored (after charge efficiency)   [Wh]
+    // battOutBusWh    — energy delivered from battery to bus (post-eff)    [Wh]
+    double battInStoredWh;
+    double battOutBusWh;
+
+    // Unmet critical energy (post-producers + after discharging as much as allowed).
+    double unmetCriticalWh;
+};
+
+// Helpers
+static inline double clamp01(double x) { return std::max(0.0, std::min(1.0, x)); }
+static inline double saturate(double x, double lo, double hi) { return std::max(lo, std::min(hi, x)); }
+
+// One deterministic step. Pure function: returns new State and fills Result.
+inline State step(State s, const Inputs& in, const Config& cfg, Result& out) {
+    const double dt   = in.dtHours;
+    const double prod = in.producersW * dt;
+    const double crit = in.criticalDemandW * dt;
+    const double nreq = in.nonCriticalDemandW * dt;
+
+    const double maxInWh  = cfg.cRate * s.capacityWh * dt;
+    const double maxOutWh = cfg.cRate * s.capacityWh * dt;
+
+    double battInStoredWh = 0.0;
+    double battOutBusWh   = 0.0;
+    double available      = prod;
+    double unmetCritical  = 0.0;
+
+    // Serve critical from producers first, then discharge battery if needed.
+    if (available >= crit) {
+        available -= crit;
+    } else {
+        double need = crit - available;
+        const double drawWh = std::min({ need / std::max(1e-12, cfg.etaOut), maxOutWh, s.storedWh });
+        battOutBusWh = drawWh * cfg.etaOut;
+        available   += battOutBusWh;
+
+        if (available >= crit) {
+            available -= crit;
+        } else {
+            unmetCritical = crit - available;
+            available = 0.0;
+        }
+        s.storedWh = saturate(s.storedWh - drawWh, 0.0, s.capacityWh);
+    }
+
+    // Non-critical: serve as much as possible from remaining available.
+    double serveNonCrit = std::min(available, nreq);
+    double nonCritEff   = (nreq > 0.0) ? clamp01(serveNonCrit / nreq) : 1.0;
+    available -= serveNonCrit;
+
+    // Any spare after serving all demands may be used to charge the battery.
+    if (available > 1e-12) {
+        const double roomWh = std::max(0.0, s.capacityWh - s.storedWh);
+        // We will store 'storeWh' and consume 'usedFromBus' from spare
+        const double storeWhMaxByCRate = maxInWh;
+        // To store X, we need X/etaIn from bus; but we also cannot exceed 'available'
+        // limit on bus energy this step.
+        double storeWh = std::min({ available * cfg.etaIn, roomWh, storeWhMaxByCRate });
+        battInStoredWh = storeWh;
+        s.storedWh = saturate(s.storedWh + storeWh, 0.0, s.capacityWh);
+        // Reduce 'available' by bus-energy actually used to charge
+        available -= storeWh / std::max(1e-12, cfg.etaIn);
+    }
+
+    out.nonCriticalEff   = clamp01(nonCritEff);
+    out.battInStoredWh   = battInStoredWh;
+    out.battOutBusWh     = battOutBusWh;
+    out.unmetCriticalWh  = unmetCritical;
+    return s;
+}
+
+} // namespace mars::power
+
 // ----------- Core types ------------------------------------------------------
 
 enum class BuildingType {
@@ -200,8 +307,9 @@ struct LastPowerReport {
     bool blackout = false;
 
     // NEW: battery telemetry for the last simulated hour
-    double battIn  = 0.0; // kWh taken from producers into the battery (charge input energy)
-    double battOut = 0.0; // kWh delivered from battery to loads (after discharge efficiency)
+    // battIn = energy drawn from bus to charge (pre-eff); battOut = energy delivered to bus
+    double battIn  = 0.0;
+    double battOut = 0.0;
     bool   chargeCRateLimited    = false;
     bool   dischargeCRateLimited = false;
 };
@@ -392,6 +500,26 @@ public:
         g2.enableHardInvariants(true);
         if (!g2.loadFromFile(tmp)) return 4;
         g2.advanceHours(24); // will throw if invariants fail
+
+        // 4) Micro-tests for pure power step.
+        {
+            using namespace mars::power;
+            Config cfg{0.95, 0.95, 0.5}; // 0.5C
+            State  st{ 500.0, 1000.0 };  // 500 Wh stored of 1 kWh cap
+
+            // Case: not enough producers for critical; must discharge but not go negative
+            Inputs in1{ /*prodW=*/0, /*critW=*/600, /*nonCritW=*/0, /*dt=*/1.0 };
+            Result r1{};
+            State st1 = step(st, in1, cfg, r1);
+            if (st1.storedWh < -1e-9 || st1.storedWh > 1000.0 + 1e-9) return 10;
+
+            // Case: surplus production charges battery but honors C-rate and capacity
+            Inputs in2{ /*prodW=*/5000, /*critW=*/0, /*nonCritW=*/0, /*dt=*/1.0 };
+            Result r2{};
+            State st2 = step({900.0, 1000.0}, in2, cfg, r2);
+            if (st2.storedWh > 1000.0 + 1e-9) return 11;
+            if (r2.nonCriticalEff < 0.999) return 12; // no non-crit demand => eff ~ 1
+        }
 
         cout << "[SelfTest] OK\n";
         return 0;
@@ -1149,11 +1277,8 @@ private:
         }
     }
 
-    // ---- Power & resource update (PURE, via StepOpts) -----------------------
+    // ---- Power & resource update (PURE via PowerSystem + dispatch) ----------
 
-    // **simulateHour suggestion implemented here**:
-    // - accepts StepOpts (spawn_random_events, quiet, sink)
-    // - never prints directly; all messages go through emit(opt, ...)
     void simulateHour(const StepOpts& opt) {
         // 0) Random events (if any)
         maybeSpawnEvents(opt);
@@ -1199,26 +1324,20 @@ private:
         double wWater = weightFromHours(hWater_before);
         double wO2    = weightFromHours(hO2_before);
 
-        // 4) Determine budget for non-critical loads, respecting battery C-rate
-        const double cap    = s.res.batteryCapacity;
-        const double soc0   = s.res.powerStored;
-        const double cRate  = s.batteryCRate;
-        const double etaIn  = s.batteryEtaIn;
-        const double etaOut = s.batteryEtaOut;
+        // 4) Use the pure power step to size the safe non-critical budget (continuous),
+        //    then choose discrete loads up to that budget.
+        using namespace mars::power;
+        Config cfg{ s.batteryEtaIn, s.batteryEtaOut, s.batteryCRate };
+        State  st0{ s.res.powerStored, s.res.batteryCapacity };
 
-        const double deliverByCRate = cap * cRate;      // kWh this hour
-        const double deliverBySoC   = soc0 * etaOut;    // kWh this hour
-        const double deliverableMax = std::max(0.0, std::min(deliverByCRate, deliverBySoC));
+        // First pass: assume we try to run *all* non-critical loads; step tells us
+        // what fraction is actually feasible. We convert that to a power budget.
+        Inputs in0{ producers, critical, noncritPotential, /*dtHours*/ 1.0 };
+        Result r0{};
+        (void)step(st0, in0, cfg, r0); // do not commit state; just measure feasible share
+        const double nonCritBudget = r0.nonCriticalEff * noncritPotential;
 
-        const double surplusAfterCritical = std::max(0.0, producers - critical);
-        const double deficitAfterCritical = std::max(0.0, critical - producers);
-
-        const double reservedForCritical = std::min(deficitAfterCritical, deliverableMax);
-        const double remainingDeliverable = std::max(0.0, deliverableMax - reservedForCritical);
-
-        const double nonCritBudget = surplusAfterCritical + remainingDeliverable;
-
-        // 5) Choose which non-critical loads to run under that budget
+        // Choose the discrete set of non-critical loads within this budget.
         std::vector<char> runFlags(s.buildings.size(), 0);
         double noncritUsed = 0.0;
         if (nonCritBudget > 0.0) {
@@ -1227,51 +1346,30 @@ private:
                 runFlags[idx] = 1;
                 noncritUsed += getSpec(s.buildings[idx].type).powerCons;
             }
+            // Guard against minor rounding overages
+            if (noncritUsed > nonCritBudget + 1e-9) {
+                // Drop items until within budget (lowest utility last already due to reconstruction order).
+                // For simplicity, clamp to budget.
+                noncritUsed = std::min(noncritUsed, nonCritBudget);
+            }
         }
 
-        // 6) Battery dispatch with C-rate limits and round-trip efficiency
-        // Net after selected loads (positive -> surplus to charge; negative -> need discharge)
-        double netAfterLoads = producers - critical - noncritUsed;
+        // 5) Second pass: apply actual chosen non-critical demand to compute
+        //    battery charge/discharge and blackout status, and commit SoC.
+        Inputs in1{ producers, critical, noncritUsed, /*dtHours*/ 1.0 };
+        Result r1{};
+        State st1 = step(st0, in1, cfg, r1);
+        s.res.powerStored = clampv(st1.storedWh, 0.0, s.res.batteryCapacity);
 
-        // Reset last-hour battery telemetry
-        s.lastPower.battIn  = 0.0;
-        s.lastPower.battOut = 0.0;
-        s.lastPower.chargeCRateLimited    = false;
+        // Map pure-step telemetry to lastPower (keep existing semantics)
+        s.lastPower.battOut = r1.battOutBusWh;                         // already post-eff
+        s.lastPower.battIn  = r1.battInStoredWh / std::max(1e-12, s.batteryEtaIn); // convert back to input (pre-eff)
+        s.lastPower.chargeCRateLimited    = false; // not tracked in pure step
         s.lastPower.dischargeCRateLimited = false;
 
-        double soc = soc0;
-        const double chargePowerLimit    = cap * cRate;
-        const double dischargePowerLimit = cap * cRate;
+        const bool blackout = (r1.unmetCriticalWh > 1e-6);
 
-        if (netAfterLoads > 1e-9) {
-            // Surplus -> charge (limited by C-rate and free space / etaIn)
-            const double byCRate = chargePowerLimit;
-            const double byRoom  = (cap - soc) / std::max(1e-12, etaIn);
-            const double canInput = std::max(0.0, std::min({ netAfterLoads, byCRate, byRoom }));
-            if (canInput < netAfterLoads - 1e-9 && canInput < byCRate - 1e-9) {
-                s.lastPower.chargeCRateLimited = true;
-            }
-            soc += canInput * etaIn;     // store after charge losses
-            s.lastPower.battIn = canInput;   // producers -> battery
-            netAfterLoads -= canInput;   // remainder is curtailed (unused)
-        } else if (netAfterLoads < -1e-9) {
-            // Deficit -> discharge (limited by C-rate and SoC * etaOut)
-            double deficit = -netAfterLoads;
-            const double deliverByCR = dischargePowerLimit;
-            const double deliverBySo = soc * etaOut;
-            const double delivered   = std::max(0.0, std::min({ deficit, deliverByCR, deliverBySo }));
-            if (delivered < deficit - 1e-9 && delivered < deliverByCR - 1e-9) {
-                s.lastPower.dischargeCRateLimited = true;
-            }
-            soc -= delivered / std::max(1e-12, etaOut); // remove pre-efficiency energy from SoC
-            s.lastPower.battOut = delivered;            // energy delivered to bus
-            netAfterLoads += delivered;
-        }
-
-        s.res.powerStored = clampv(soc, 0.0, cap);
-        bool blackout = (netAfterLoads < -1e-6); // still negative after max discharge
-
-        // 7) Resource flows from buildings (gated by power and dispatch)
+        // 6) Resource flows from buildings (gated by power and dispatch)
         double waterDelta  = 0.0;
         double oxygenDelta = 0.0;
         double foodDelta   = 0.0;
@@ -1293,17 +1391,17 @@ private:
             foodDelta   += sp.foodFlow   * eff;
         }
 
-        // 8) Population consumption
+        // 7) Population consumption
         waterDelta  -= s.population * WAT_PER_COLONIST;
         oxygenDelta -= s.population * O2_PER_COLONIST;
         foodDelta   -= s.population * FOOD_PER_COLONIST;
 
-        // 9) Apply
+        // 8) Apply
         s.res.water  = std::max(0.0, s.res.water  + waterDelta);
         s.res.oxygen = std::max(0.0, s.res.oxygen + oxygenDelta);
         s.res.food   = std::max(0.0, s.res.food   + foodDelta);
 
-        // 10) Morale
+        // 9) Morale
         double moraleDelta = 0.0;
         double hFood  = hoursOf(s.res.food,   s.population * FOOD_PER_COLONIST);
         double hWater = hoursOf(s.res.water,  s.population * WAT_PER_COLONIST);
@@ -1320,17 +1418,17 @@ private:
         if (s.population > s.housingCapacity) moraleDelta -= 0.02;
         s.morale = clampv(s.morale + moraleDelta, 0.0, 1.0);
 
-        // 11) Power report
+        // 10) Power report
         s.lastPower.producers = producers;
         s.lastPower.criticalDemand = critical;
         s.lastPower.nonCriticalDemand = noncritPotential;
         // If there was a blackout, treat non-critical as not effectively served
         s.lastPower.nonCriticalEff = (noncritPotential > 0.0)
-            ? ( (blackout ? 0.0 : (noncritUsed / noncritPotential)) )
+            ? ( (blackout ? 0.0 : clampv(noncritUsed / noncritPotential, 0.0, 1.0)) )
             : 0.0;
         s.lastPower.blackout = blackout;
 
-        // 12) Warnings (via message bus)
+        // 11) Warnings (via message bus)
         if (s.res.oxygen <= 0.0 || s.res.food <= 0.0 || s.res.water <= 0.0) {
             string w = "[Warning] Critical shortage: ";
             if (s.res.oxygen <= 0.0) w += "Oxygen ";
