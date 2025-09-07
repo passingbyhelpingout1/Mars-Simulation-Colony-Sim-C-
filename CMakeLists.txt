@@ -8,7 +8,8 @@ add_compile_options(-O2 -Wall -Wextra)
 include_directories(${CMAKE_SOURCE_DIR})
 
 add_executable(mars
-    ui/cli/main.cpp
+    mars_colony.cpp            # new tiny main
+    ui/cli/app.cpp             # new CLI module
     engine/power.cpp
     engine/events.cpp
     engine/step.cpp
