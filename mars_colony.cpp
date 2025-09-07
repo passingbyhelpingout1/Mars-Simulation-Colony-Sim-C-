@@ -18,6 +18,10 @@
      - CLI: --record FILE (write header + subsequent orders), --replay FILE (load and schedule).
      - Orders are applied at the start of each hour before weather and sim.
      - Forecasts include pending orders by simulating on a cloned state/queue.
+   • **Simulation invariants + headless self-test + CI-friendly flags.**
+     - CLI: --check-invariants (throw on invariant failure each hour), --selftest (run deterministic test).
+     - Invariants catch NaNs/negatives, SoC bounds, eta/C-rate ranges, etc.
+     - Self-test abuses forecast and save/load, returns non-zero on failure.
 
   Build (MinGW-w64 g++):
     g++ -std=c++17 -O2 -Wall -Wextra -o MarsColony.exe mars_colony.cpp
@@ -38,6 +42,7 @@
 #include <cstdint>
 #include <cmath>
 #include <numeric>
+#include <stdexcept>
 
 using std::cout;
 using std::cin;
@@ -239,6 +244,55 @@ public:
     void setSeed(uint32_t seed) {
         s.rngSeed = seed;
         s.rng.seed(seed);
+    }
+
+    // Enable/disable throwing on invariant failures each simulated hour.
+    void enableHardInvariants(bool on) { hardFailOnInvariant = on; }
+
+    // Run a deterministic, headless self-test for CI.
+    // Returns 0 on success, non-zero on failure.
+    int runSelfTest() {
+        // Build a separate Game instance so we don't disturb *this*
+        Game g;
+        g.enableHardInvariants(true);
+        g.setSeed(123456789u);
+
+        // 1) Advance and place a couple of buildings deterministically.
+        g.advanceHours(24);
+        g.queueBuildNow(BuildingType::SolarArray);
+        g.advanceHours(48);
+        g.queueBuildNow(BuildingType::BatteryBank);
+        g.advanceHours(24);
+
+        // 2) Forecast must be non-destructive (state unchanged afterwards).
+        auto before = g;              // deep copy (allowed for members)
+        g.forecastHours(72);          // private method; accessible within class
+        auto after = g;
+
+        auto feq = [](double a, double b){ return std::fabs(a - b) <= 1e-9; };
+        bool same =
+            (before.s.hour == after.s.hour) &&
+            feq(before.s.res.powerStored, after.s.res.powerStored) &&
+            feq(before.s.res.water,       after.s.res.water) &&
+            feq(before.s.res.oxygen,      after.s.res.oxygen) &&
+            feq(before.s.res.food,        after.s.res.food);
+
+        if (!same) {
+            cout << "[SelfTest] forecastHours mutated state.\n";
+            return 2;
+        }
+
+        // 3) Save/Load round-trip + continue sim should not trip invariants.
+        const char* tmp = "selftest.mc";
+        if (!g.saveToFile(tmp)) return 3;
+
+        Game g2;
+        g2.enableHardInvariants(true);
+        if (!g2.loadFromFile(tmp)) return 4;
+        g2.advanceHours(24); // will throw if invariants fail
+
+        cout << "[SelfTest] OK\n";
+        return 0;
     }
 
     // --- Recording / Replay (public API) ------------------------------------
@@ -514,6 +568,12 @@ public:
             maybeSpawnEvents();
             simulateHour();
             tickEffects();
+
+            // Lightweight invariant check each hour (throws if enabled)
+            if (!checkInvariants(false) && hardFailOnInvariant) {
+                throw std::runtime_error("Simulation invariant failed.");
+            }
+
             ++s.hour;
         }
         cout << "Advanced " << hours << " " << pluralize("hour", hours)
@@ -523,6 +583,9 @@ public:
 private:
     GameState s;
     bool forecastMode = false; // suppress logs during look-ahead simulations
+
+    // Invariant behavior
+    bool hardFailOnInvariant = false;
 
     // --- Deterministic command queue + (optional) recording ------------------
     std::multimap<long long, Command> pendingCommands;
@@ -1167,6 +1230,44 @@ private:
             cout << "!\n";
         }
     }
+
+    // ---- Invariants ---------------------------------------------------------
+
+    bool checkInvariants(bool verbose) const {
+        auto finite = [](double v){ return std::isfinite(v); };
+        bool ok = true;
+        auto bad = [&](const char* msg){
+            if (verbose) cout << "[Invariant] " << msg << "\n";
+            ok = false;
+        };
+
+        const auto& r = s.res;
+        if (!finite(r.powerStored) || r.powerStored < -1e-9) bad("powerStored finite & >= 0");
+        if (!finite(r.batteryCapacity) || r.batteryCapacity < -1e-9) bad("batteryCapacity finite & >= 0");
+        if (r.powerStored > r.batteryCapacity + 1e-6) bad("powerStored <= batteryCapacity");
+        if (!finite(r.water)  || r.water  < -1e-9) bad("water >= 0");
+        if (!finite(r.oxygen) || r.oxygen < -1e-9) bad("oxygen >= 0");
+        if (!finite(r.food)   || r.food   < -1e-9) bad("food >= 0");
+
+        if (s.population < 0) bad("population >= 0");
+        if (s.housingCapacity < 0) bad("housingCapacity >= 0");
+
+        if (!finite(s.morale) || s.morale < -1e-9 || s.morale > 1.0 + 1e-9) bad("morale in [0,1]");
+        if (!finite(s.batteryCRate) || s.batteryCRate < 0) bad("batteryCRate >= 0");
+        if (!finite(s.batteryEtaIn) || s.batteryEtaIn <= 0 || s.batteryEtaIn > 1.0) bad("batteryEtaIn in (0,1]");
+        if (!finite(s.batteryEtaOut)|| s.batteryEtaOut<= 0 || s.batteryEtaOut> 1.0) bad("batteryEtaOut in (0,1]");
+
+        const auto& lp = s.lastPower;
+        if (!finite(lp.producers) || !finite(lp.criticalDemand) || !finite(lp.nonCriticalDemand) || !finite(lp.nonCriticalEff))
+            bad("lastPower fields finite");
+        if (lp.nonCriticalEff < -1e-6 || lp.nonCriticalEff > 1.0 + 1e-6) bad("nonCriticalEff in [0,1]");
+        if (!finite(lp.battIn)  || lp.battIn  < -1e-9) bad("battIn >= 0");
+        if (!finite(lp.battOut) || lp.battOut < -1e-9) bad("battOut >= 0");
+
+        if (s.hour < 0) bad("hour >= 0");
+
+        return ok;
+    }
 };
 
 // ----------- Entry point -----------------------------------------------------
@@ -1185,6 +1286,10 @@ int main(int argc, char** argv) {
 
     // NEW: recording/replay paths
     string recordPath, replayPath;
+
+    // NEW: invariant & self-test flags
+    bool checkInvariantsFlag = false;
+    bool runSelfTestFlag = false;
 
     // Parse simple CLI flags
     for (int i = 1; i < argc; ++i) {
@@ -1207,11 +1312,21 @@ int main(int argc, char** argv) {
             recordPath = argv[++i];
         } else if (arg == "--replay" && i + 1 < argc) {
             replayPath = argv[++i];
+        } else if (arg == "--check-invariants") {
+            checkInvariantsFlag = true;
+        } else if (arg == "--selftest") {
+            runSelfTestFlag = true;
         }
     }
 
     try {
         Game g;
+
+        // Early self-test path (for CI): do nothing else.
+        if (runSelfTestFlag) {
+            int code = g.runSelfTest();
+            return code;
+        }
 
         // If user provided a seed explicitly, apply it first.
         if (seedProvided) g.setSeed(seedOverride);
@@ -1233,6 +1348,9 @@ int main(int argc, char** argv) {
             const bool userProvidedSeedOrSave = seedProvided || saveLoaded;
             g.loadReplayFile(replayPath, allowSeedOverride, userProvidedSeedOrSave);
         }
+
+        // Enable hard invariant checking if requested.
+        if (checkInvariantsFlag) g.enableHardInvariants(true);
 
         if (autorunHours > 0) {
             g.advanceHours((int)autorunHours);
