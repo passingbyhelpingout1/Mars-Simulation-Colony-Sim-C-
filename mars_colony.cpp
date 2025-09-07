@@ -26,6 +26,7 @@
 #include <sstream>
 #include <fstream>
 #include <cstdint>
+#include <cmath>
 
 using std::cout;
 using std::cin;
@@ -340,8 +341,9 @@ public:
                  << "6) Tips\n"
                  << "7) Save game\n"
                  << "8) Load game\n"
+                 << "9) Power forecast (24h)\n"
                  << "0) Quit\n";
-            int choice = readInt("Select: ", 0, 8);
+            int choice = readInt("Select: ", 0, 9);
             switch (choice) {
                 case 1: showStatus(); break;
                 case 2: advanceHours(1); break;
@@ -351,6 +353,7 @@ public:
                 case 6: printTips(); break;
                 case 7: { string f = readLine("Save file name", "savegame.mc"); saveToFile(f); } break;
                 case 8: { string f = readLine("Load file name", "savegame.mc"); loadFromFile(f); } break;
+                case 9: forecastHours(24); break;
                 case 0: running = false; break;
                 default: cout << "Unknown selection.\n"; break;
             }
@@ -376,6 +379,7 @@ public:
 
 private:
     GameState s;
+    bool forecastMode = false; // suppress logs during look-ahead simulations
 
     void initStarter() {
         // Starter setup
@@ -399,8 +403,24 @@ private:
     long long sol() const { return s.hour / SOL_HOURS; }
 
     double daylightFactor() const {
-        int h = hourOfSol();
-        return (h >= DAYLIGHT_START && h < DAYLIGHT_END) ? 1.0 : 0.0;
+        // Smooth cosine twilight ramp around sunrise/sunset
+        constexpr double TW = 1.5; // twilight duration (hours)
+        const double h = static_cast<double>(hourOfSol());
+        const double a = DAYLIGHT_START - TW; // start of sunrise ramp
+        const double b = DAYLIGHT_START + TW; // end of sunrise ramp (full daylight)
+        const double c = DAYLIGHT_END   - TW; // start of sunset ramp
+        const double d = DAYLIGHT_END   + TW; // end of sunset ramp (night)
+
+        auto ease = [](double t) {
+            const double PI = 3.14159265358979323846;
+            t = clampv(t, 0.0, 1.0);
+            return 0.5 - 0.5 * std::cos(t * PI); // 0..1
+        };
+
+        if (h <= a || h >= d) return 0.0;   // night
+        if (h >= b && h <= c) return 1.0;   // full daylight
+        if (h > a && h < b)   return ease((h - a) / (b - a)); // sunrise ramp
+        /* h in (c,d) */      return ease((d - h) / (d - c)); // sunset ramp
     }
 
     double stormSolarMultiplier() const {
@@ -565,7 +585,7 @@ private:
             e.solarMultiplier = mult(s.rng);
             e.description = "Dust Storm (solar " + std::to_string(int(e.solarMultiplier*100)) + "%)";
             s.effects.push_back(e);
-            cout << "[Event] A dust storm rolls in! Solar output reduced.\n";
+            if (!forecastMode) cout << "[Event] A dust storm rolls in! Solar output reduced.\n";
         }
 
         // Meteoroid (6%): destroy a random non-battery building
@@ -579,7 +599,7 @@ private:
                 std::uniform_int_distribution<int> pick(0, (int)candidates.size()-1);
                 int idx = candidates[pick(s.rng)];
                 auto btype = s.buildings[idx].type;
-                cout << "[Event] Meteoroid strike! " << to_string(btype) << " destroyed.\n";
+                if (!forecastMode) cout << "[Event] Meteoroid strike! " << to_string(btype) << " destroyed.\n";
                 const auto& sp = getSpec(btype);
                 s.housingCapacity -= sp.housing;
                 s.housingCapacity = std::max(s.housingCapacity, 0);
@@ -595,7 +615,7 @@ private:
             s.res.food   += 80.0;
             s.res.metals += 60;
             s.res.credits+= 400;
-            cout << "[Event] Orbital supply drop delivered! Stocks replenished.\n";
+            if (!forecastMode) cout << "[Event] Orbital supply drop delivered! Stocks replenished.\n";
         }
     }
 
@@ -607,7 +627,7 @@ private:
             std::remove_if(s.effects.begin(), s.effects.end(),
                 [&](const ActiveEffect& e){
                     if (e.hoursRemaining <= 0) {
-                        cout << "[Weather] " << e.description << " has cleared.\n";
+                        if (!forecastMode) cout << "[Weather] " << e.description << " has cleared.\n";
                         return true;
                     }
                     return false;
@@ -678,6 +698,68 @@ private:
             if (take[i][c]) { chosen.push_back(items[i - 1].idx); c -= items[i - 1].w; }
         }
         return chosen;
+    }
+
+    // ---- Forecast (what-if) -------------------------------------------------
+
+    void forecastHours(int hours) {
+        hours = std::max(0, hours);
+        auto backup = s;
+        const bool oldFM = forecastMode;
+        forecastMode = true;
+
+        vector<double> batt, prod, crit, noncritRun;
+        vector<int>    solv, hourv;
+        vector<char>   blackout;
+        batt.reserve(hours); prod.reserve(hours); crit.reserve(hours);
+        noncritRun.reserve(hours); solv.reserve(hours); hourv.reserve(hours); blackout.reserve(hours);
+
+        for (int i = 0; i < hours; ++i) {
+            // Do NOT spawn new random events during forecast
+            simulateHour();
+            tickEffects();
+            ++s.hour;
+
+            batt.push_back(s.res.powerStored);
+            prod.push_back(s.lastPower.producers);
+            crit.push_back(s.lastPower.criticalDemand);
+            noncritRun.push_back(s.lastPower.nonCriticalDemand * s.lastPower.nonCriticalEff);
+            blackout.push_back(s.lastPower.blackout ? 1 : 0);
+            solv.push_back(static_cast<int>(s.hour / SOL_HOURS));
+            hourv.push_back(static_cast<int>(s.hour % SOL_HOURS));
+        }
+
+        // Restore state
+        forecastMode = oldFM;
+        s = std::move(backup);
+
+        // Summaries
+        double minBat = *std::min_element(batt.begin(), batt.end());
+        double maxBat = *std::max_element(batt.begin(), batt.end());
+        int firstBO = -1;
+        for (int i = 0; i < hours; ++i) if (blackout[i]) { firstBO = i; break; }
+
+        cout << "\n=== Power Forecast (" << hours << "h) ===\n";
+        cout << "Battery range: " << std::fixed << std::setprecision(1)
+             << minBat << " .. " << maxBat << "  (cap " << s.res.batteryCapacity << ")\n";
+        if (firstBO >= 0) {
+            cout << "BLACKOUT predicted at +" << firstBO
+                 << "h (Sol " << solv[firstBO] << ", Hour " << hourv[firstBO] << ")\n";
+        } else {
+            cout << "No blackout predicted.\n";
+        }
+
+        cout << "\nhr  sol:hr  prod  crit  noncrit  batt  note\n";
+        for (int i = 0; i < hours; i += 6) {
+            cout << std::setw(2) << i
+                 << "  " << std::setw(2) << solv[i] << ":" << std::setw(2) << hourv[i]
+                 << "  " << std::setw(5) << std::fixed << std::setprecision(1) << prod[i]
+                 << "  " << std::setw(5) << crit[i]
+                 << "  " << std::setw(7) << noncritRun[i]
+                 << "  " << std::setw(6) << batt[i]
+                 << (blackout[i] ? "  *BLACKOUT*" : "")
+                 << "\n";
+        }
     }
 
     // ---- Power & resource update -------------------------------------------
@@ -801,7 +883,7 @@ private:
         s.lastPower.blackout = blackout;
 
         // 9) Warnings
-        if (s.res.oxygen <= 0.0 || s.res.food <= 0.0 || s.res.water <= 0.0) {
+        if (!forecastMode && (s.res.oxygen <= 0.0 || s.res.food <= 0.0 || s.res.water <= 0.0)) {
             cout << "[Warning] Critical shortage: ";
             if (s.res.oxygen <= 0.0) cout << "Oxygen ";
             if (s.res.water  <= 0.0) cout << "Water ";
