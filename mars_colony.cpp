@@ -1,15 +1,13 @@
 // mars_colony.cpp
 // Deterministic headless runner + interactive fallback.
 //
-// Contract preserved:
+// CI contract:
 //   mars.exe --replay <file> --hours <N> --hash-only
 //     -> prints exactly:  STATE_HASH <16-digit UPPERCASE HEX>\n  and exits 0.
 //
-// Improvements:
-// - Cross-arch identical hashes via LE canonicalization.
-// - Streaming file hashing + small sample buffer for per-tick mixing.
-// - Safer CLI (--ticks/--minutes/--hours/--seed) with graceful fallbacks.
-// - Fixed-width uppercase hex printing (no locale surprises).
+// Windows fix:
+//   Put stdout/stderr into BINARY mode so '\n' is not translated to '\r\n',
+//   preventing PowerShell regex anchors from failing on the trailing '\r'.
 
 #include <algorithm>
 #include <cstdint>
@@ -20,7 +18,12 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include <inttypes.h> // for PRIX64
+#include <inttypes.h> // PRIX64
+
+#ifdef _WIN32
+  #include <io.h>
+  #include <fcntl.h>
+#endif
 
 namespace mars { namespace cli { int run(int argc, char** argv); } }
 
@@ -37,7 +40,7 @@ static inline uint64_t fnv1a64_update(uint64_t h, const void* data, size_t n) {
     return h;
 }
 
-// Canonical little-endian updates, independent of host endianness.
+// Canonical little-endian updates (cross-arch stable).
 static inline uint64_t fnv1a64_u32_le(uint64_t h, uint32_t v) {
     unsigned char b[4] = {
         static_cast<unsigned char>(v & 0xFFu),
@@ -63,7 +66,6 @@ static inline uint64_t fnv1a64_u64_le(uint64_t h, uint64_t v) {
 
 // Stream a file into a hash and also capture a small sample of bytes
 // (first half + last half) for deterministic per-tick mixing.
-// sample_max is small (e.g., 4096) to keep memory use tiny.
 static uint64_t hash_file_streaming(const std::string& path,
                                     std::vector<unsigned char>* sample,
                                     size_t sample_max = 4096) {
@@ -88,12 +90,8 @@ static uint64_t hash_file_streaming(const std::string& path,
 
         if (sample) {
             const unsigned char* ub = reinterpret_cast<const unsigned char*>(buf.data());
-            // Fill head with earliest bytes (up to head_max).
             size_t can_copy_head = std::min<size_t>(static_cast<size_t>(n), head_max - head.size());
-            if (can_copy_head > 0) {
-                head.insert(head.end(), ub, ub + can_copy_head);
-            }
-            // Everything beyond head goes into tail (we keep the last tail_max bytes).
+            if (can_copy_head > 0) head.insert(head.end(), ub, ub + can_copy_head);
             size_t start_tail = can_copy_head;
             if (static_cast<size_t>(n) > start_tail) {
                 size_t tcount = static_cast<size_t>(n) - start_tail;
@@ -116,7 +114,6 @@ static uint64_t hash_file_streaming(const std::string& path,
 
 // ---------- Tiny deterministic PRNG ----------
 static inline uint32_t xorshift32(uint32_t& s) {
-    // Plain, well-defined integer ops.
     s ^= (s << 13);
     s ^= (s >> 17);
     s ^= (s << 5);
@@ -163,7 +160,7 @@ struct Options {
     std::string replay_path;
     uint64_t    ticks     = 0;    // authoritative tick count
     bool        hash_only = false;
-    uint32_t    seed      = 0x9E3779B9u; // default if not provided
+    uint32_t    seed      = 0x9E3779B9u; // default seed
     bool        headless  = false;
     bool        ok        = true;
 };
@@ -179,8 +176,7 @@ static bool parse_u64(const char* s, uint64_t& out) {
 static bool parse_u64_to_u32_seed(const char* s, uint32_t& out) {
     uint64_t v64 = 0;
     if (!parse_u64(s, v64)) return false;
-    // Fold into 32 bits deterministically
-    out = static_cast<uint32_t>( (v64 & 0xFFFFFFFFu) ^ (v64 >> 32) );
+    out = static_cast<uint32_t>((v64 & 0xFFFFFFFFu) ^ (v64 >> 32));
     return true;
 }
 static bool checked_mul(uint64_t a, uint64_t b, uint64_t& out) {
@@ -191,9 +187,8 @@ static bool checked_mul(uint64_t a, uint64_t b, uint64_t& out) {
 
 static Options parse_args(int argc, char** argv) {
     Options o{};
-    // Environment seed fallback (if provided)
     if (const char* env = std::getenv("MARS_DEFAULT_SEED")) {
-        (void)parse_u64_to_u32_seed(env, o.seed); // ignore failure silently
+        (void)parse_u64_to_u32_seed(env, o.seed);
     }
 
     uint64_t hours = 0, minutes = 0, ticks = 0;
@@ -220,18 +215,16 @@ static Options parse_args(int argc, char** argv) {
         } else if (a == "--hash-only" || a == "-q") {
             o.hash_only = true; o.headless = true;
         } else if (a == "--help" || a == "-h" || a == "/?") {
-            o.ok = false; // trigger usage
-            break;
+            o.ok = false; break;
         } else {
-            // Unknown flag: ignore to stay robust in CI contexts.
+            // Ignore unknown flags (robust CI behavior).
         }
     }
 
-    // Priority: --ticks > --minutes > --hours
     if (ticks_set) {
         o.ticks = ticks;
     } else if (minutes_set) {
-        o.ticks = minutes;
+        o.ticks = minutes; // 1 tick = 1 minute
     } else if (hours_set) {
         uint64_t t = 0;
         if (!checked_mul(hours, 60ULL, t)) { o.ok = false; }
@@ -248,9 +241,8 @@ static void print_usage() {
         << "  mars.exe                     (interactive fallback)\n";
 }
 
-// Headless execution used by CI and automation.
+// Headless execution used by CI/automation.
 static int run_headless(const Options& opt) {
-    // Prepare replay influence
     std::vector<unsigned char> sample;
     uint64_t replay_hash = 0ULL;
     if (!opt.replay_path.empty()) {
@@ -259,26 +251,20 @@ static int run_headless(const Options& opt) {
 
     World w{};
     w.rng = opt.seed ^ static_cast<uint32_t>(replay_hash) ^ static_cast<uint32_t>(replay_hash >> 32);
-
-    // N.B. small bounded offsets to initial state from replay hash make the
-    // outcome depend on the replay file but remain deterministic.
     w.oxygen_mg += static_cast<int32_t>(replay_hash & 1023ULL);
     w.power_mW  += static_cast<int32_t>((replay_hash >> 10) & 2047ULL) - 1024;
 
     const size_t wheel = sample.size();
     for (uint64_t i = 0; i < opt.ticks; ++i) {
-        if (wheel) {
-            // Per-tick mixing of a sampled byte; deterministic modulo.
-            w.rng ^= sample[static_cast<size_t>(i % wheel)];
-        }
+        if (wheel) w.rng ^= sample[static_cast<size_t>(i % wheel)];
         step(w);
     }
 
     const uint64_t hash = world_checksum(w);
 
     if (opt.hash_only) {
-        // Print exactly one line, fixed width uppercase 16-digit hex.
         std::printf("STATE_HASH %016" PRIX64 "\n", hash);
+        std::fflush(stdout);
     } else {
         std::cout << "Ticks: " << opt.ticks
                   << "  O2=" << w.oxygen_mg << "mg"
@@ -286,11 +272,12 @@ static int run_headless(const Options& opt) {
                   << "  T=" << w.temp_milK << " mK"
                   << "  P=" << w.power_mW << " mW\n";
         std::printf("STATE_HASH %016" PRIX64 "\n", hash);
+        std::fflush(stdout);
     }
     return 0;
 }
 
-// Interactive fallback (unchanged UX, slightly richer status).
+// Interactive fallback.
 static int run_interactive() {
     World w{};
     std::cout << "Mars Colony (CLI fallback)\n"
@@ -305,6 +292,7 @@ static int run_interactive() {
         } else if (cmd == "s" || cmd == "status") {
             std::printf("tick=%" PRIu64 " O2=%dmg CO2=%dmg T=%dmK P=%dmW  STATE_HASH %016" PRIX64 "\n",
                         w.tick, w.oxygen_mg, w.co2_mg, w.temp_milK, w.power_mW, world_checksum(w));
+            std::fflush(stdout);
         } else {
             std::cout << "unknown command: " << cmd << "\n";
         }
@@ -318,8 +306,8 @@ int run(int argc, char** argv) {
 
     if (!opt.ok) {
         if (headless_requested && opt.hash_only) {
-            // CI-friendly: never fail a pure hash-only call due to arg issues.
             std::printf("STATE_HASH %016" PRIX64 "\n", 0ULL);
+            std::fflush(stdout);
             return 0;
         }
         print_usage();
@@ -334,5 +322,10 @@ int run(int argc, char** argv) {
 #endif // MARS_HAS_EXTERNAL_CLI
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    // CRLF -> binary mode so '\n' is not auto-translated to "\r\n".
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
+#endif
     return mars::cli::run(argc, argv);
 }
