@@ -7,11 +7,17 @@ add_compile_options(-O2 -Wall -Wextra)
 
 include_directories(${CMAKE_SOURCE_DIR})
 
-add_executable(mars
-    mars_colony.cpp            # new tiny main
-    ui/cli/app.cpp             # new CLI module
-    engine/power.cpp
-    engine/events.cpp
-    engine/step.cpp
-    engine/persist.cpp
+add_library(mars_sim
+    src/sim/World.cpp
+    src/sim/Simulation.cpp
+    src/sim/Recorder.cpp
 )
+target_include_directories(mars_sim PUBLIC src)
+
+add_executable(mars_colony src/main.cpp)
+target_link_libraries(mars_colony PRIVATE mars_sim)
+
+enable_testing()
+add_executable(determinism_test tests/determinism.cpp)
+target_link_libraries(determinism_test PRIVATE mars_sim)
+add_test(NAME determinism COMMAND determinism_test)
