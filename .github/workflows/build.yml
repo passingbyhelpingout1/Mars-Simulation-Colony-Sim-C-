@@ -18,10 +18,9 @@ jobs:
         run: cmake --build build --config Release --parallel 2
 
       - name: Smoke test (hash-only)
-        if: matrix.os != 'windows-latest'
-        run: |
-          ./build/mars --hash-only | tee out.txt
-          grep -E "^STATE_HASH [0-9A-F]{16}$" out.txt
+        - name: Smoke test
+        working-directory: build
+        run: ctest -C Release --output-on-failure
 
       - name: Smoke test (hash-only) [Windows]
         if: matrix.os == 'windows-latest'
