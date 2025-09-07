@@ -14,16 +14,35 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      # Linux toolchain setup (unchanged)
       - name: Set up C++
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y g++ clang
-      - name: Build
+
+      # Choose compiler in this step, then build with -Isrc
+      - name: Build (g++/clang++)
+        if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: |
           if [[ "${{ matrix.compiler }}" == "clang" ]]; then CXX=clang++; else CXX=g++; fi
-          $CXX -std=c++17 -O2 -Wall -Wextra -o mars mars_colony.cpp
-      - name: Self-test
+          $CXX -std=c++17 -O2 -Wall -Wextra -Isrc -o mars mars_colony.cpp
+
+      - name: Build (MinGW on Windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          if [[ "${{ matrix.compiler }}" == "clang" ]]; then CXX=clang++; else CXX=g++; fi
+          $CXX -std=c++17 -O2 -Wall -Wextra -Isrc -o mars.exe mars_colony.cpp
+
+      - name: Self-test (Linux)
+        if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: ./mars --selftest
+
+      - name: Self-test (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: ./mars.exe --selftest
