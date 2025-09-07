@@ -14,6 +14,10 @@
    • Save/Load v2 (backward compatible with v1) to persist new battery parameters.
    • Power forecast shows scheduled charge/discharge totals.
    • Status panel shows battery model parameters.
+   • **Deterministic command log (record/replay of build orders).**
+     - CLI: --record FILE (write header + subsequent orders), --replay FILE (load and schedule).
+     - Orders are applied at the start of each hour before weather and sim.
+     - Forecasts include pending orders by simulating on a cloned state/queue.
 
   Build (MinGW-w64 g++):
     g++ -std=c++17 -O2 -Wall -Wextra -o MarsColony.exe mars_colony.cpp
@@ -180,6 +184,16 @@ static const BuildingSpec& getSpec(BuildingType t) {
     return DB.at(t);
 }
 
+// ----------- Commands (event-sourced) ---------------------------------------
+
+enum class CommandType { Build /*, Toggle could be added later with IDs*/ };
+
+struct Command {
+    long long hour = 0;         // when to apply (start of hour)
+    CommandType type{};
+    int a = 0;                  // payload: for Build -> static_cast<int>(BuildingType)
+};
+
 // ----------- Simulation ------------------------------------------------------
 
 struct GameState {
@@ -225,6 +239,104 @@ public:
     void setSeed(uint32_t seed) {
         s.rngSeed = seed;
         s.rng.seed(seed);
+    }
+
+    // --- Recording / Replay (public API) ------------------------------------
+
+    // Start writing commands to a file. Writes/overwrites a header immediately.
+    bool startRecordingTo(const string& path) {
+        std::ofstream ofs(path, std::ios::out | std::ios::trunc);
+        if (!ofs) { cout << "Failed to open '" << path << "' for recording.\n"; return false; }
+        ofs << "MARS_REPLAY 1\n";
+        ofs << "seed " << s.rngSeed << "\n";
+        ofs << "start_hour " << s.hour << "\n";
+        ofs << "endheader\n";
+        ofs.close();
+        recordPath = path;
+        recording = true;
+        recordHeaderWritten = true;
+        cout << "Recording orders to '" << recordPath << "'.\n";
+        return true;
+    }
+
+    // Load a replay file and enqueue its commands. If it contains a seed and
+    // allowSeedOverride is true (and no save was loaded), apply that seed now.
+    bool loadReplayFile(const string& path, bool allowSeedOverride, bool userProvidedSeedOrSaveAlready) {
+        std::ifstream ifs(path, std::ios::in);
+        if (!ifs) { cout << "Failed to open replay '" << path << "'.\n"; return false; }
+
+        string tag; int version = 0;
+        if (!(ifs >> tag >> version) || tag != "MARS_REPLAY" || version != 1) {
+            cout << "Unrecognized replay header.\n"; return false;
+        }
+        // consume rest of line
+        ifs.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+
+        uint32_t replSeed = 0;
+        bool hasSeed = false;
+        long long startHour = 0;
+        bool inHeader = true;
+        size_t loaded = 0;
+
+        string line;
+        while (std::getline(ifs, line)) {
+            if (line.empty()) continue;
+            std::istringstream iss(line);
+            if (inHeader) {
+                string k; iss >> k;
+                if (k == "seed") {
+                    iss >> replSeed; hasSeed = true;
+                } else if (k == "start_hour") {
+                    iss >> startHour;
+                } else if (k == "endheader") {
+                    inHeader = false;
+                }
+                continue;
+            }
+
+            // Commands section
+            // Formats supported:
+            //  "h <hour> build <typeInt>"
+            //  "build <hour> <typeInt>"
+            string k; iss >> k;
+            if (k == "h") {
+                long long h; string what; int t;
+                if (iss >> h >> what >> t) {
+                    if (what == "build") {
+                        Command c; c.hour = h; c.type = CommandType::Build; c.a = t;
+                        pendingCommands.emplace(c.hour, c);
+                        ++loaded;
+                    }
+                }
+            } else if (k == "build") {
+                long long h; int t;
+                if (iss >> h >> t) {
+                    Command c; c.hour = h; c.type = CommandType::Build; c.a = t;
+                    pendingCommands.emplace(c.hour, c);
+                    ++loaded;
+                }
+            } else if (k == "end") {
+                break;
+            } else if (k[0] == '#') {
+                // comment line
+            } else {
+                // ignore unknown line
+            }
+        }
+
+        // Apply seed from replay if allowed and user didn't already set one/load a save
+        if (hasSeed && allowSeedOverride && !userProvidedSeedOrSaveAlready) {
+            setSeed(replSeed);
+            cout << "Replay seed applied: " << replSeed << "\n";
+        }
+
+        // Keep the file path (useful for messaging only)
+        replayLoaded = true;
+        replayPath = path;
+        cout << "Loaded " << loaded << " order" << (loaded==1?"":"s")
+             << " from replay '" << path << "'.\n";
+        if (hasSeed) cout << "Replay metadata: seed=" << replSeed << ", start_hour=" << startHour << "\n";
+        return true;
     }
 
     bool saveToFile(const string& path) const {
@@ -396,6 +508,9 @@ public:
     void advanceHours(int hours) {
         hours = std::max(0, hours);
         for (int i = 0; i < hours; ++i) {
+            // Apply all commands scheduled for THIS hour before events/simulation
+            applyCommandsForHour(s.hour);
+
             maybeSpawnEvents();
             simulateHour();
             tickEffects();
@@ -408,6 +523,59 @@ public:
 private:
     GameState s;
     bool forecastMode = false; // suppress logs during look-ahead simulations
+
+    // --- Deterministic command queue + (optional) recording ------------------
+    std::multimap<long long, Command> pendingCommands;
+    string recordPath;
+    bool recording = false;
+    bool recordHeaderWritten = false;
+    bool replayLoaded = false;
+    string replayPath;
+
+    // Enqueue a command (and record it if recording is active).
+    void submit(const Command& c) {
+        pendingCommands.emplace(c.hour, c);
+        if (recording) recordCommand(c);
+    }
+
+    // Append a single command line to the recording file.
+    void recordCommand(const Command& c) {
+        if (!recordHeaderWritten || recordPath.empty()) return;
+        std::ofstream ofs(recordPath, std::ios::out | std::ios::app);
+        if (!ofs) { cout << "Warning: failed to append to '" << recordPath << "'.\n"; return; }
+        switch (c.type) {
+            case CommandType::Build:
+                ofs << "h " << c.hour << " build " << c.a << "\n";
+                break;
+        }
+    }
+
+    // Apply all commands scheduled for the given hour.
+    void applyCommandsForHour(long long hourNow) {
+        auto range = pendingCommands.equal_range(hourNow);
+        for (auto it = range.first; it != range.second; ++it) {
+            const Command& c = it->second;
+            switch (c.type) {
+                case CommandType::Build: {
+                    BuildingType bt = static_cast<BuildingType>(c.a);
+                    bool ok = tryBuild(bt);
+                    if (!forecastMode) {
+                        if (ok) cout << "[Order] Build " << to_string(bt) << " completed at start of hour " << hourNow << ".\n";
+                        else    cout << "[Order] Build " << to_string(bt) << " FAILED (resources insufficient) at hour " << hourNow << ".\n";
+                    }
+                } break;
+            }
+        }
+        pendingCommands.erase(range.first, range.second);
+    }
+
+    // Queue from UI and apply immediately this hour (so behavior matches old build flow).
+    void queueBuildNow(BuildingType t) {
+        Command c; c.hour = s.hour; c.type = CommandType::Build; c.a = static_cast<int>(t);
+        submit(c);
+        // Apply instantly for current hour (keeps UX same as before and ensures recording)
+        applyCommandsForHour(s.hour);
+    }
 
     void initStarter() {
         // Starter setup
@@ -524,6 +692,13 @@ private:
                 cout << "  * " << e.description << " — " << e.hoursRemaining << "h remaining\n";
             }
         }
+
+        if (recording) {
+            cout << "[Recording] Orders are being logged to '" << recordPath << "'.\n";
+        }
+        if (replayLoaded) {
+            cout << "[Replay] Orders have been loaded from '" << replayPath << "'.\n";
+        }
     }
 
     void printTips() const {
@@ -535,6 +710,7 @@ private:
         cout << "* Watch the power line (prod/crit/noncrit). Avoid blackouts.\n";
         cout << "* Try advancing 6-24 hours, then build with the resources you have.\n";
         cout << "* Save often! You can reload and explore different strategies.\n";
+        cout << "* Use --record to capture your build orders; later use --replay to reproduce a run.\n";
     }
 
     void listBuildOptions() const {
@@ -579,11 +755,9 @@ private:
             default: cout << "Invalid selection.\n"; return;
         }
 
-        if (tryBuild(chosen)) {
-            cout << "Construction complete: " << to_string(chosen) << "\n";
-        } else {
-            cout << "Not enough resources to build that.\n";
-        }
+        // Route through deterministic command system (+record if enabled)
+        queueBuildNow(chosen);
+        // The command executor prints success/failure. Nothing else needed here.
     }
 
     bool tryBuild(BuildingType t) {
@@ -740,6 +914,7 @@ private:
     void forecastHours(int hours) {
         hours = std::max(0, hours);
         auto backup = s;
+        auto cmdBackup = pendingCommands;   // include scheduled orders in look-ahead
         const bool oldFM = forecastMode;
         forecastMode = true;
 
@@ -751,6 +926,9 @@ private:
         solv.reserve(hours); hourv.reserve(hours); blackout.reserve(hours);
 
         for (int i = 0; i < hours; ++i) {
+            // Apply any orders due at this forecast hour (non-destructive; we restore later)
+            applyCommandsForHour(s.hour);
+
             // Do NOT spawn new random events during forecast
             simulateHour();
             tickEffects();
@@ -767,9 +945,10 @@ private:
             hourv.push_back(static_cast<int>(s.hour % SOL_HOURS));
         }
 
-        // Restore state
+        // Restore state + command queue
         forecastMode = oldFM;
         s = std::move(backup);
+        pendingCommands = std::move(cmdBackup);
 
         // Summaries
         double minBat = *std::min_element(batt.begin(), batt.end());
@@ -1004,6 +1183,9 @@ int main(int argc, char** argv) {
     uint32_t seedOverride = 0;
     string loadPath, savePath;
 
+    // NEW: recording/replay paths
+    string recordPath, replayPath;
+
     // Parse simple CLI flags
     for (int i = 1; i < argc; ++i) {
         string arg = argv[i];
@@ -1021,15 +1203,35 @@ int main(int argc, char** argv) {
             loadPath = argv[++i];
         } else if (arg == "--save" && i + 1 < argc) {
             savePath = argv[++i];
+        } else if (arg == "--record" && i + 1 < argc) {
+            recordPath = argv[++i];
+        } else if (arg == "--replay" && i + 1 < argc) {
+            replayPath = argv[++i];
         }
     }
 
     try {
         Game g;
+
+        // If user provided a seed explicitly, apply it first.
         if (seedProvided) g.setSeed(seedOverride);
 
+        // If we loaded a save, that sets RNG state deterministically; do it before replay.
+        bool saveLoaded = false;
         if (!loadPath.empty()) {
-            g.loadFromFile(loadPath);
+            saveLoaded = g.loadFromFile(loadPath);
+        }
+
+        // Start recording (writes header with current seed + hour)
+        if (!recordPath.empty()) {
+            g.startRecordingTo(recordPath);
+        }
+
+        // Load replay commands (may also set seed if allowed and no save/seed already)
+        if (!replayPath.empty()) {
+            const bool allowSeedOverride = true;
+            const bool userProvidedSeedOrSave = seedProvided || saveLoaded;
+            g.loadReplayFile(replayPath, allowSeedOverride, userProvidedSeedOrSave);
         }
 
         if (autorunHours > 0) {
