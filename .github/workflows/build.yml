@@ -2,38 +2,54 @@ name: build
 on: [push, pull_request]
 
 jobs:
-  build-all:
+  build:
+    name: Build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Configure
+      # Ensure MSVC environment is initialized on Windows
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure (CMake)
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build --config Release --parallel 2
 
-      - name: Smoke test (hash-only)
-        - name: Smoke test
+      - name: Smoke test (ctest)
         working-directory: build
         run: ctest -C Release --output-on-failure
 
-      - name: Smoke test (hash-only) [Windows]
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          $out = & .\build\Release\mars.exe --hash-only
-          $out
-          if ($out -notmatch '^STATE_HASH [0-9A-F]{16}$') { throw "STATE_HASH not found" }
-
-      - name: Upload artifacts
+      # Optional: publish whatever binary(s) the project produced.
+      # These steps won't fail the job if nothing matches.
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: mars-${{ runner.os }}
+          name: build-${{ runner.os }}
           path: |
-            build/Release/mars.exe
+            build/Release/*.exe
+            build/*.exe
+          if-no-files-found: ignore
+
+      - name: Upload artifact (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ runner.os }}
+          path: |
             build/mars
+            build/*/mars
+            build/*.out
+          if-no-files-found: ignore
