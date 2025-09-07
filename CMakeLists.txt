@@ -1,11 +1,16 @@
-cmake_minimum_required(VERSION 3.20)
-project(MarsColonySim LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.12)
+project(MarsSimCli CXX)
+
 set(CMAKE_CXX_STANDARD 17)
-add_library(mars_core
-    src/core/sim.cpp
-    src/core/persist.cpp    # when you move save/load v2 here
-    src/core/replay.cpp     # when you move record/replay here
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_compile_options(-O2 -Wall -Wextra)
+
+include_directories(${CMAKE_SOURCE_DIR})
+
+add_executable(mars
+    ui/cli/main.cpp
+    engine/power.cpp
+    engine/events.cpp
+    engine/step.cpp
+    engine/persist.cpp
 )
-target_include_directories(mars_core PUBLIC src)
-add_executable(mars_cli src/app/main.cpp)
-target_link_libraries(mars_cli PRIVATE mars_core)
