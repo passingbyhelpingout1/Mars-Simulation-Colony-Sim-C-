@@ -1,15 +1,32 @@
-# Build helper for Windows
+# Get-MarsExe.ps1
 $ErrorActionPreference = "Stop"
 
-# Configure with Visual Studio generator
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+# You can override these from the command line:
+#   .\Get-MarsExe.ps1 -Config Release -UseAsan $false -WarningsAsErrors $true
+param(
+  [ValidateSet("Debug","Release")][string]$Config = "Release",
+  [bool]$UseAsan = $false,
+  [bool]$WarningsAsErrors = $false,
+  [bool]$UseLto = $true
+)
 
-# Parallel build (CMake maps to MSBuild's /m)
-cmake --build build --config Release --parallel 2
+$asan = if ($UseAsan) { "ON" } else { "OFF" }
+$wx   = if ($WarningsAsErrors) { "ON" } else { "OFF" }
+$lto  = if ($UseLto) { "ON" } else { "OFF" }
 
-# Copy the exe next to this script for convenience
-$exe = Join-Path -Path "build\Release" -ChildPath "mars_colony.exe"
+cmake -S . -B build -DCMAKE_BUILD_TYPE=$Config `
+  -DMARS_ENABLE_ASAN=$asan `
+  -DMARS_WARNINGS_AS_ERRORS=$wx `
+  -DMARS_ENABLE_LTO=$lto
+
+cmake --build build --config $Config
+
+$exe = Join-Path -Path "build\$Config" -ChildPath "mars.exe"
+if (-not (Test-Path $exe)) { $exe = "build\mars.exe" } # non-MSVC generators
+
 if (Test-Path $exe) {
-    Copy-Item $exe -Destination ".\mars_colony.exe" -Force
+  Copy-Item $exe -Destination ".\mars.exe" -Force
+  Write-Host "Built mars.exe ($Config)"
+} else {
+  throw "mars.exe not found"
 }
-Write-Host "Built: $exe"
