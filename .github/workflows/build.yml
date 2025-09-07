@@ -53,3 +53,17 @@ jobs:
             build/*/mars
             build/*.out
           if-no-files-found: ignore
+       
+      - name: Determinism smoke test
+  run: |
+    if [ "${{ runner.os }}" = "Windows" ]; then
+      .\build\Release\mars.exe --ticks 10000 --hash-only > out.txt
+      type out.txt
+      set /p EXPECTED=< tests\expected_hash.txt
+      for /f %%i in (out.txt) do set ACTUAL=%%i
+      if not "%ACTUAL%"=="%EXPECTED%" ( exit /b 1 )
+    else
+      ./build/mars --ticks 10000 --hash-only > out.txt
+      cat out.txt
+      diff -u out.txt tests/expected_hash.txt
+    fi  
