@@ -1,28 +1,46 @@
 name: build
+
 on:
   push:
   pull_request:
 
 jobs:
-  cmake:
+  build:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure (Release)
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      # ---- Configure ----
+      # Use the right generator per-OS.
+      - name: Configure (Windows, MSBuild)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 
+      - name: Configure (macOS/Linux, single-config)
+        if: runner.os != 'Windows'
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      # ---- Build (cross-platform parallelism) ----
       - name: Build
-        run: cmake --build build --config Release -- -j 2
+        run: cmake --build build --config Release --parallel 2
 
-      - name: Upload artifact (all OS)
+      # ---- Upload artifacts ----
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: mars_colony-${{ runner.os }}
-          path: |
-            build/Release/mars_colony.exe
-            build/mars_colony
+          path: build/Release/mars_colony.exe
+
+      - name: Upload artifact (macOS/Linux)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mars_colony-${{ runner.os }}
+          path: build/mars_colony
