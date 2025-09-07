@@ -43,6 +43,8 @@
 #include <cmath>
 #include <numeric>
 #include <stdexcept>
+#include "fixed_clock.h"
+#include "rng.h"
 
 using std::cout;
 using std::cin;
